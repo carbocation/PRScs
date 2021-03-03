@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 
 """
 Random variate generator for the generalized inverse Gaussian distribution.
