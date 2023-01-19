@@ -144,7 +144,7 @@ def main():
     param_dict = parse_param()
 
     for chrom in param_dict['chrom']:
-        print('##### process chromosome %d #####' % int(chrom))
+        print('##### process chromosome %d #####' % int(chrom), flush=True)
 
         if '1kg' in os.path.basename(param_dict['ref_dir']):
             ref_dict = parse_genet.parse_ref(param_dict['ref_dir'] + '/snpinfo_1kg_hm3', int(chrom))
@@ -160,7 +160,7 @@ def main():
         mcmc_gtb.mcmc(param_dict['a'], param_dict['b'], param_dict['phi'], sst_dict, param_dict['n_gwas'], ld_blk, blk_size,
             param_dict['n_iter'], param_dict['n_burnin'], param_dict['thin'], int(chrom), param_dict['out_dir'], param_dict['beta_std'], param_dict['seed'])
 
-        print('\n')
+        print('\n', flush=True)
 
 
 if __name__ == '__main__':

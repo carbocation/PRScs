@@ -13,7 +13,7 @@ import gigrnd
 
 
 def mcmc(a, b, phi, sst_dict, n, ld_blk, blk_size, n_iter, n_burnin, thin, chrom, out_dir, beta_std, seed):
-    print('... MCMC ...')
+    print('... MCMC ...', flush=True)
 
     # seed
     if seed != None:
@@ -43,7 +43,7 @@ def mcmc(a, b, phi, sst_dict, n, ld_blk, blk_size, n_iter, n_burnin, thin, chrom
     # MCMC
     for itr in range(1,n_iter+1):
         if itr % 100 == 0:
-            print('--- iter-' + str(itr) + ' ---')
+            print('--- iter-' + str(itr) + ' ---', flush=True)
 
         mm = 0; quad = 0.0
         for kk in range(n_blk):
@@ -94,8 +94,8 @@ def mcmc(a, b, phi, sst_dict, n, ld_blk, blk_size, n_iter, n_burnin, thin, chrom
 
     # print estimated phi
     if phi_updt == True:
-        print('... Estimated global shrinkage parameter: %1.2e ...' % phi_est )
+        print('... Estimated global shrinkage parameter: %1.2e ...' % phi_est , flush=True)
 
-    print('... Done ...')
+    print('... Done ...', flush=True)
 
 
