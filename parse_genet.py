@@ -58,25 +58,40 @@ def parse_sumstats(ref_dict, vld_dict, sst_file, n_subj):
         header = next(ff)
         for line in ff:
             ll = (line.strip()).split()
-            if ll[1] in ATGC and ll[2] in ATGC:
-                sst_dict['SNP'].append(ll[0])
-                sst_dict['A1'].append(ll[1])
-                sst_dict['A2'].append(ll[2])
+            # if ll[1] in ATGC and ll[2] in ATGC: # By removing this check, we keep every variant including indels
+            sst_dict['SNP'].append(ll[0])
+            sst_dict['A1'].append(ll[1])
+            sst_dict['A2'].append(ll[2])
 
     print('... %d SNPs read from %s ...' % (len(sst_dict['SNP']), sst_file))
 
 
     mapping = {'A': 'T', 'T': 'A', 'C': 'G', 'G': 'C'}
+    def comp(allele):
+        """Return Watson–Crick complement for A/T/G/C; leave any longer allele unchanged."""
+        return mapping.get(allele, allele)
 
     vld_snp = set(zip(vld_dict['SNP'], vld_dict['A1'], vld_dict['A2']))
 
-    ref_snp = set(zip(ref_dict['SNP'], ref_dict['A1'], ref_dict['A2'])) | set(zip(ref_dict['SNP'], ref_dict['A2'], ref_dict['A1'])) | \
-              set(zip(ref_dict['SNP'], [mapping[aa] for aa in ref_dict['A1']], [mapping[aa] for aa in ref_dict['A2']])) | \
-              set(zip(ref_dict['SNP'], [mapping[aa] for aa in ref_dict['A2']], [mapping[aa] for aa in ref_dict['A1']]))
-    
-    sst_snp = set(zip(sst_dict['SNP'], sst_dict['A1'], sst_dict['A2'])) | set(zip(sst_dict['SNP'], sst_dict['A2'], sst_dict['A1'])) | \
-              set(zip(sst_dict['SNP'], [mapping[aa] for aa in sst_dict['A1']], [mapping[aa] for aa in sst_dict['A2']])) | \
-              set(zip(sst_dict['SNP'], [mapping[aa] for aa in sst_dict['A2']], [mapping[aa] for aa in sst_dict['A1']]))
+    # ----- for the reference panel -----
+    ref_snp = (
+        set(zip(ref_dict['SNP'], ref_dict['A1'], ref_dict['A2'])) |
+        set(zip(ref_dict['SNP'], ref_dict['A2'], ref_dict['A1'])) |
+        set(zip(ref_dict['SNP'], [comp(a) for a in ref_dict['A1']],
+                            [comp(a) for a in ref_dict['A2']])) |
+        set(zip(ref_dict['SNP'], [comp(a) for a in ref_dict['A2']],
+                            [comp(a) for a in ref_dict['A1']]))
+    )
+
+    # ----- for the summary-statistics file -----
+    sst_snp = (
+        set(zip(sst_dict['SNP'], sst_dict['A1'], sst_dict['A2'])) |
+        set(zip(sst_dict['SNP'], sst_dict['A2'], sst_dict['A1'])) |
+        set(zip(sst_dict['SNP'], [comp(a) for a in sst_dict['A1']],
+                            [comp(a) for a in sst_dict['A2']])) |
+        set(zip(sst_dict['SNP'], [comp(a) for a in sst_dict['A2']],
+                            [comp(a) for a in sst_dict['A1']]))
+    )
 
     comm_snp = vld_snp & ref_snp & sst_snp
 
@@ -91,9 +106,10 @@ def parse_sumstats(ref_dict, vld_dict, sst_file, n_subj):
         for line in ff:
             ll = (line.strip()).split()
             snp = ll[0]; a1 = ll[1]; a2 = ll[2]
-            if a1 not in ATGC or a2 not in ATGC:
-                continue
-            if (snp, a1, a2) in comm_snp or (snp, mapping[a1], mapping[a2]) in comm_snp:
+            # Commented out to permit indels
+            # if a1 not in ATGC or a2 not in ATGC:
+            #     continue
+            if (snp, a1, a2) in comm_snp or (snp, comp(a1), comp(a2)) in comm_snp:
                 if 'BETA' in header:
                     beta = float(ll[3])
                 elif 'OR' in header:
@@ -108,7 +124,7 @@ def parse_sumstats(ref_dict, vld_dict, sst_file, n_subj):
 
                 sst_eff.update({snp: beta_std})
 
-            elif (snp, a2, a1) in comm_snp or (snp, mapping[a2], mapping[a1]) in comm_snp:
+            elif (snp, a2, a1) in comm_snp or (snp, comp(a2), comp(a1)) in comm_snp:
                 if 'BETA' in header:
                     beta = float(ll[3])
                 elif 'OR' in header:
@@ -143,14 +159,14 @@ def parse_sumstats(ref_dict, vld_dict, sst_file, n_subj):
                 sst_dict['A2'].append(a1)
                 sst_dict['MAF'].append(1-ref_dict['MAF'][ii])
                 sst_dict['FLP'].append(-1)
-            elif (snp, mapping[a1], mapping[a2]) in comm_snp:
-                sst_dict['A1'].append(mapping[a1])
-                sst_dict['A2'].append(mapping[a2])
+            elif (snp, comp(a1), comp(a2)) in comm_snp:
+                sst_dict['A1'].append(comp(a1))
+                sst_dict['A2'].append(comp(a2))
                 sst_dict['MAF'].append(ref_dict['MAF'][ii])
                 sst_dict['FLP'].append(1)
-            elif (snp, mapping[a2], mapping[a1]) in comm_snp:
-                sst_dict['A1'].append(mapping[a2])
-                sst_dict['A2'].append(mapping[a1])
+            elif (snp, comp(a2), comp(a1)) in comm_snp:
+                sst_dict['A1'].append(comp(a2))
+                sst_dict['A2'].append(comp(a1))
                 sst_dict['MAF'].append(1-ref_dict['MAF'][ii])
                 sst_dict['FLP'].append(-1)
 
