@@ -5,11 +5,16 @@ Markov Chain Monte Carlo (MCMC) sampler for polygenic prediction with continuous
 
 """
 
+import gigrnd
 
 import numpy as np
-from scipy import linalg 
-import gigrnd
-import logging, sys
+from scipy import linalg
+from scipy.stats import geninvgauss
+from joblib import Parallel, delayed
+
+import logging
+import os
+import sys
 
 logging.basicConfig(
     level=logging.INFO,                  # change to DEBUG for finer detail
@@ -19,9 +24,25 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
+# ---------- helper for one LD block ----------
+def _sample_block(ld, psi_blk, beta_mrg_blk, sigma, n, block_seed=None):
+    """Draw β for one LD block and return (β_block, quadratic form)."""
+    rng = np.random.default_rng(block_seed)
+    dinvt = ld + np.diag(1.0 / psi_blk)
+    chol  = linalg.cholesky(dinvt)
+    z     = rng.standard_normal((len(psi_blk), 1)) * np.sqrt(sigma / n)
+    beta_b = linalg.solve_triangular(
+        chol,
+        linalg.solve_triangular(chol, beta_mrg_blk, trans='T') + z,
+        trans='N'
+    )
+    quad_b = float(beta_b.T @ dinvt @ beta_b)
+    return beta_b, quad_b
 
 def mcmc(a, b, phi, sst_dict, n, ld_blk, blk_size, n_iter, n_burnin, thin, chrom, out_dir, beta_std, write_psi, write_pst, seed):
     print('... MCMC ...')
+
+    n_jobs = int(os.environ.get("PRSCS_N_JOBS", "1"))     # default: 1
 
     # seed
     if seed is not None:
@@ -33,6 +54,10 @@ def mcmc(a, b, phi, sst_dict, n, ld_blk, blk_size, n_iter, n_burnin, thin, chrom
     n_pst = int((n_iter-n_burnin)/thin)
     p = len(sst_dict['SNP'])
     n_blk = len(ld_blk)
+
+    # --- block index bookkeeping ---
+    starts = np.cumsum([0] + blk_size[:-1])       # 0-based starts
+    idx_ranges = [range(s, s + sz) for s, sz in zip(starts, blk_size)]
 
     # initialization
     beta = np.zeros((p,1))
@@ -58,19 +83,23 @@ def mcmc(a, b, phi, sst_dict, n, ld_blk, blk_size, n_iter, n_burnin, thin, chrom
         if itr % 10 == 0:          # adjust the modulus for how chatty you want it
             log.info('chr %d  started iteration %d of %d', chrom, itr, n_iter)
 
-        mm = 0; quad = 0.0
-        for kk in range(n_blk):
-            if blk_size[kk] == 0:
-                continue
-            else:
-                idx_blk = range(mm,mm+blk_size[kk])
-                dinvt = ld_blk[kk]+np.diag(1.0/psi[idx_blk].T[0])
-                dinvt_chol = linalg.cholesky(dinvt)
-                sd = float(np.sqrt(sigma / n))
-                beta_tmp = linalg.solve_triangular(dinvt_chol, beta_mrg[idx_blk], trans='T') + sd*np.random.randn(len(idx_blk),1)
-                beta[idx_blk] = linalg.solve_triangular(dinvt_chol, beta_tmp, trans='N')
-                quad += float(np.dot(np.dot(beta[idx_blk].T, dinvt), beta[idx_blk]))
-                mm += blk_size[kk]
+        # --- parallel block sampler -------------------
+        active = [(k, r) for k, r in enumerate(idx_ranges) if blk_size[k] > 0]
+        results = Parallel(n_jobs=n_jobs, backend="loky", prefer="processes")(
+                    delayed(_sample_block)(ld_blk[k],
+                                        psi[r, 0],
+                                        beta_mrg[r],
+                                        sigma, 
+                                        n,
+                                        block_seed=(None if seed is None else seed + itr * 1_000_003 + k))
+                    for k, r in active
+                )
+
+        quad = 0.0
+        for (r, (beta_b, quad_b)) in zip([r for _, r in active], results):
+            beta[r] = beta_b
+            quad   += quad_b
+        # ----------------------------------------------------
 
         s1 = float((beta * beta_mrg).sum())
         s2 = float((beta**2 / psi).sum())
@@ -83,18 +112,21 @@ def mcmc(a, b, phi, sst_dict, n, ld_blk, blk_size, n_iter, n_burnin, thin, chrom
 
         delta = np.random.gamma(a+b, 1.0/(psi+phi))
 
-        for jj in range(p):
-            delta_val = delta[jj, 0].item()
-            beta_val  = beta[jj,  0].item()
-
-            # compute ψ_j as a float and store back into the (p,1) array
-            psi[jj, 0] = gigrnd.gigrnd(
-                float(a - 0.5),
-                float(2.0 * delta_val),
-                float(n * (beta_val**2) / sigma)
-            )
-        
-        psi[psi>1] = 1.0
+        # --- vectorised ψ-update ---------------------------------
+        if seed is None:
+            rng_psi = None                       # let SciPy pick its own RNG
+        else:
+            # one unique seed per iteration (no dependence on n_jobs)
+            rng_psi = np.random.default_rng(seed + itr * 2_000_033)
+        psi[:, 0] = geninvgauss.rvs(
+                    a - 0.5,                      # shape  p = a – ½
+                    2.0 * delta.ravel(),          # scale  b = 2 δⱼ
+                    scale = sigma / (n * (beta.ravel() ** 2)),
+                    size  = p,                     # draw p values
+                    random_state = rng_psi
+                )
+        psi[psi > 1.0] = 1.0
+        # ---------------------------------------------------------
 
         if phi_updt == True:
             w = np.random.gamma(1.0, 1.0/(phi+1.0))
