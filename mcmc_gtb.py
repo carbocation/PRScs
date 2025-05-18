@@ -9,6 +9,15 @@ Markov Chain Monte Carlo (MCMC) sampler for polygenic prediction with continuous
 import numpy as np
 from scipy import linalg 
 import gigrnd
+import logging, sys
+
+logging.basicConfig(
+    level=logging.INFO,                  # change to DEBUG for finer detail
+    format='%(asctime)s  %(levelname)s  %(message)s',
+    stream=sys.stdout,                   # ensures Docker/cluster stdout sees it
+    force=True                           # overrides any prior config
+)
+log = logging.getLogger(__name__)
 
 
 def mcmc(a, b, phi, sst_dict, n, ld_blk, blk_size, n_iter, n_burnin, thin, chrom, out_dir, beta_std, write_psi, write_pst, seed):
@@ -46,8 +55,8 @@ def mcmc(a, b, phi, sst_dict, n, ld_blk, blk_size, n_iter, n_burnin, thin, chrom
     # MCMC
     pp = 0
     for itr in range(1,n_iter+1):
-        if itr % 100 == 0:
-            print('--- iter-' + str(itr) + ' ---')
+        if itr % 10 == 0:          # adjust the modulus for how chatty you want it
+            log.info('chr %d  started iteration %d of %d', chrom, itr, n_iter)
 
         mm = 0; quad = 0.0
         for kk in range(n_blk):
