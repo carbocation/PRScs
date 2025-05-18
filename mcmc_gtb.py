@@ -80,9 +80,6 @@ def mcmc(a, b, phi, sst_dict, n, ld_blk, blk_size, n_iter, n_burnin, thin, chrom
     # MCMC
     pp = 0
     for itr in range(1,n_iter+1):
-        if itr % 10 == 0:          # adjust the modulus for how chatty you want it
-            log.info('chr %d  started iteration %d of %d', chrom, itr, n_iter)
-
         # --- parallel block sampler -------------------
         active = [(k, r) for k, r in enumerate(idx_ranges) if blk_size[k] > 0]
         results = Parallel(n_jobs=n_jobs, backend="loky", prefer="processes")(
@@ -94,6 +91,10 @@ def mcmc(a, b, phi, sst_dict, n, ld_blk, blk_size, n_iter, n_burnin, thin, chrom
                                         block_seed=(None if seed is None else seed + itr * 1_000_003 + k))
                     for k, r in active
                 )
+
+        if itr % 10 == 0:
+            log.info('chr %d  started iteration %d of %d', chrom, itr, n_iter)
+            print(f"[DEBUG] chr {chrom} completed iteration {itr} of {n_iter} with n_jobs={n_jobs} and non-empty blocks={len(active)}")
 
         quad = 0.0
         for (r, (beta_b, quad_b)) in zip([r for _, r in active], results):
