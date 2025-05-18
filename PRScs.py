@@ -100,6 +100,8 @@ def main():
             ref_dict = parse_genet.parse_ref(param_dict['ref_dir'] + '/snpinfo_1kg_hm3', int(chrom))
         elif 'ukbb' in os.path.basename(param_dict['ref_dir']):
             ref_dict = parse_genet.parse_ref(param_dict['ref_dir'] + '/snpinfo_ukbb_hm3', int(chrom))
+        elif 'ld_matrix' in os.path.basename(param_dict['ref_dir']):
+            ref_dict = parse_genet.parse_ref(param_dict['ref_dir'] + '/snpinfo_ukbb_hm3', int(chrom))
 
         vld_dict = parse_genet.parse_bim(param_dict['bim_prefix'], int(chrom))
 

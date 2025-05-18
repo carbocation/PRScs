@@ -180,6 +180,8 @@ def parse_ldblk(ldblk_dir, sst_dict, chrom):
         chr_name = ldblk_dir + '/ldblk_1kg_chr' + str(chrom) + '.hdf5'
     elif 'ukbb' in os.path.basename(ldblk_dir):
         chr_name = ldblk_dir + '/ldblk_ukbb_chr' + str(chrom) + '.hdf5'
+    elif 'ld_matrix' in os.path.basename(ldblk_dir):
+        chr_name = ldblk_dir + '/chr' + str(chrom) + '.hdf5'
 
     hdf_chr = h5py.File(chr_name, 'r')
     n_blk = len(hdf_chr)
