@@ -11,6 +11,8 @@ from scipy import linalg
 import gigrnd
 import logging, sys
 
+import time, collections
+
 logging.basicConfig(
     level=logging.INFO,                  # change to DEBUG for finer detail
     format='%(asctime)s  %(levelname)s  %(message)s',
@@ -52,12 +54,20 @@ def mcmc(a, b, phi, sst_dict, n, ld_blk, blk_size, n_iter, n_burnin, thin, chrom
     sigma_est = 0.0
     phi_est = 0.0
 
+    timer  = collections.Counter()
+    counts = collections.Counter()
+
     # MCMC
     pp = 0
     for itr in range(1,n_iter+1):
-        if itr % 10 == 0:          # adjust the modulus for how chatty you want it
+        loop_start = time.perf_counter()
+        
+        if itr % 1 == 0:
             log.info('chr %d  started iteration %d of %d', chrom, itr, n_iter)
+            print(f"[DEBUG] chr {chrom} completed iteration {itr} of {n_iter} with no parallelism")
 
+        # --- block sampler -------------------
+        t0 = time.perf_counter()
         mm = 0; quad = 0.0
         for kk in range(n_blk):
             if blk_size[kk] == 0:
@@ -72,6 +82,9 @@ def mcmc(a, b, phi, sst_dict, n, ld_blk, blk_size, n_iter, n_burnin, thin, chrom
                 quad += float(np.dot(np.dot(beta[idx_blk].T, dinvt), beta[idx_blk]))
                 mm += blk_size[kk]
 
+        timer['beta'] += time.perf_counter() - t0
+        counts['beta'] += 1
+
         s1 = float((beta * beta_mrg).sum())
         s2 = float((beta**2 / psi).sum())
         e1 = float(n/2.0*(1.0 - 2.0*s1 + quad))
@@ -83,6 +96,9 @@ def mcmc(a, b, phi, sst_dict, n, ld_blk, blk_size, n_iter, n_burnin, thin, chrom
 
         delta = np.random.gamma(a+b, 1.0/(psi+phi))
 
+        # ---------- ψ-update ----------
+        t0 = time.perf_counter()
+        
         for jj in range(p):
             delta_val = delta[jj, 0].item()
             beta_val  = beta[jj,  0].item()
@@ -95,6 +111,10 @@ def mcmc(a, b, phi, sst_dict, n, ld_blk, blk_size, n_iter, n_burnin, thin, chrom
             )
         
         psi[psi>1] = 1.0
+
+        timer['psi'] += time.perf_counter() - t0
+        counts['psi'] += 1
+        # ------------------------------
 
         if phi_updt == True:
             w = np.random.gamma(1.0, 1.0/(phi+1.0))
@@ -110,6 +130,15 @@ def mcmc(a, b, phi, sst_dict, n, ld_blk, blk_size, n_iter, n_burnin, thin, chrom
             if write_pst == 'TRUE':
                 beta_pst[:,[pp]] = beta
                 pp += 1
+
+        timer['loop'] += time.perf_counter() - loop_start
+        counts['loop'] += 1        # same as number of iterations
+        b  = timer['beta'] / max(counts['beta'], 1)
+        ps = timer['psi']  / max(counts['psi'],  1)
+        lo = timer['loop'] / max(counts['loop'], 1)
+        print(f"[PROFILE chr{chrom}] iter {itr:4d} | "
+            f"β {b:6.3f}s  ψ {ps:6.3f}s  other {lo-b-ps:6.3f}s "
+            f"(tot {lo:6.3f}s)")
 
     # convert standardized beta to per-allele beta
     if beta_std == 'FALSE':
