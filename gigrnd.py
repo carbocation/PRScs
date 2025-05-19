@@ -41,13 +41,17 @@ def gigrnd(p, a, b):
     lam = p
     omega = math.sqrt(a*b)
 
+    omega2 = omega*omega
+    lam2   = lam*lam
+
     if lam < 0:
         lam = -lam
         swap = True
     else:
         swap = False
 
-    alpha = math.sqrt(math.pow(omega,2)+math.pow(lam,2))-lam
+    alpha = math.sqrt(omega2+lam2)-lam
+    alpha2 = alpha*alpha
 
     # find t
     x = -psi(1.0, alpha, lam)
@@ -79,9 +83,9 @@ def gigrnd(p, a, b):
         elif alpha == 0:
             s = 1.0/lam
         elif lam == 0:
-            s = math.log(1.0+1.0/alpha+math.sqrt(1.0/math.pow(alpha,2)+2.0/alpha))
+            s = math.log(1.0+1.0/alpha+math.sqrt(1.0/alpha2+2.0/alpha))
         else:
-            s = min(1.0/lam, math.log(1.0+1.0/alpha+math.sqrt(1.0/math.pow(alpha,2)+2.0/alpha)))
+            s = min(1.0/lam, math.log(1.0+1.0/alpha+math.sqrt(1.0/alpha2+2.0/alpha)))
 
     # find auxiliary parameters
     eta = -psi(t, alpha, lam)
@@ -114,7 +118,7 @@ def gigrnd(p, a, b):
             break
 
     # transform back to the three-parameter version gig(p,a,b)
-    rnd = math.exp(rnd)*(lam/omega+math.sqrt(1.0+math.pow(lam,2)/math.pow(omega,2)))
+    rnd = math.exp(rnd)*(lam/omega+math.sqrt(1.0+lam2/omega2))
     if swap:
         rnd = 1.0/rnd
 

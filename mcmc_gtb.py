@@ -9,8 +9,7 @@ import gigrnd
 
 import numpy as np
 from scipy import linalg
-from joblib import Parallel, delayed
-from joblib import parallel
+from joblib import Parallel, delayed, parallel_backend
 from threadpoolctl import threadpool_limits
 
 import time, collections
@@ -28,34 +27,38 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 # ---------- helper for one LD block ----------
-def _sample_block_wrapped(state, psi_blk, beta_mrg_blk, sigma, n, block_seed=None):
-    """Restrict MKL threads inside each joblib worker."""
-    with threadpool_limits(limits=1, user_api="blas"):
-        return _sample_block(state, psi_blk, beta_mrg_blk, sigma, n, block_seed)
-
-def _sample_block(state, psi_blk, beta_mrg_blk, sigma, n, block_seed=None):
+def _sample_block_fused(state, psi_slice, sigma, n):
     """
-    Draw β for one LD block and return (β_block, quadratic form).
+    Same as before but:
+      • computes 1/ψ inside the worker (parallel)
+      • no external RNG contention
     """
-    rng = np.random.default_rng(block_seed)
+    L         = state["L"]
+    diag_o    = state["diag_curr"]
+    y0        = state["y0"]
+    invpsi    = state["invpsi"]
+    rng       = state["rng"]
+    zbuf      = state["zbuf"]
 
-    # --- fast diagonal update ---------------------------------------------
-    diag_new = (1.0 / psi_blk).astype(state['L'].dtype, copy=False)
-    gigrnd.chol_diag_update_inplace(state['L'], state['diag_curr'], diag_new)
-    # state['diag_curr'] was updated in-place by the kernel
+    # zero-allocation
+    rng.standard_normal(out=zbuf)
+    zbuf *= (sigma/n)**0.5
 
-    # --- Gibbs draw --------------------------------------------------------
-    z = rng.standard_normal((len(psi_blk), 1)) * np.sqrt(sigma / n)
-    beta_b = linalg.solve_triangular(
-        state['L'],
-        linalg.solve_triangular(state['L'], beta_mrg_blk, trans='T') + z,
-        trans='N'
-    )
-    # more expensive quadratic form:
-    # quad_b = float(beta_b.T @ (state['L'] @ state['L'].T) @ beta_b)
-    # cheaper quadratic form: || Lᵀ β ||²
-    tmp     = linalg.solve_triangular(state['L'], beta_b, trans='T', lower=True)
-    quad_b  = float((tmp * tmp).sum())
+    # ── 1/ψ overwrite (cheap, runs in worker) ────────────────────────
+    np.reciprocal(psi_slice, out=invpsi) # zero-alloc
+
+    # ── in-place diagonal update ─────────────────────────────────────
+    gigrnd.chol_diag_update_inplace(L, diag_o, invpsi)
+    diag_o[:] = invpsi                              # keep book-keeping
+
+    # ── Gibbs draw for β  (only ONE triangular solve) ───────────────
+    # beta_b = linalg.solve_triangular(L, y0 + zbuf, lower=True)
+    rhs = y0 + zbuf                  # no copy, just view addition
+    beta_b = linalg.blas.dtrsv(L, rhs, lower=1)   # in-place overwrite of rhs
+
+    tmp = linalg.blas.dtrmv(L, beta_b, lower=1, trans=1)   # y = Lᵀ β
+    quad_b  = float(tmp @ tmp)                        # BLAS dot
+
     return beta_b, quad_b
 
 def mcmc(a, b, phi, sst_dict, n, ld_blk, blk_size, n_iter, n_burnin, thin, chrom, out_dir, beta_std, write_psi, write_pst, seed):
@@ -89,8 +92,20 @@ def mcmc(a, b, phi, sst_dict, n, ld_blk, blk_size, n_iter, n_burnin, thin, chrom
             block_state.append(None)
             continue
         L0 = linalg.cholesky(ld_blk[k] + np.eye(blk_size[k]), lower=True)
-        d0 = np.ones(blk_size[k], dtype=L0.dtype)           # current 1/ψ (starts at 1)
-        block_state.append({'L': L0, 'diag_curr': d0})
+        y0  = linalg.solve_triangular(  # ← pre-compute Lᵀ \ β_marg
+                L0.T,                   # (does **not** change with ψ)
+                beta_mrg[r],
+                lower=False
+        )
+        state_dict={
+            'L': L0,                                           # current Cholesky factor
+            "diag_curr": np.ones(blk_size[k], dtype=L0.dtype), # current 1/ψ (starts at 1)
+            "y0"       : y0,                                   # cached solve
+            "invpsi"   : np.empty(blk_size[k], dtype=L0.dtype),       # scratch (re-used each iter)
+            "zbuf"     : np.empty_like(y0),
+            "rng"      : np.random.default_rng(None if seed is None else seed + k)
+        }
+        block_state.append(state_dict)
 
     # initialization
     beta = np.zeros((p,1))
@@ -99,6 +114,8 @@ def mcmc(a, b, phi, sst_dict, n, ld_blk, blk_size, n_iter, n_burnin, thin, chrom
 
     beta_1d = beta[:, 0]    # view – updates automatically
     psi_1d  = psi[:, 0]     # view – output buffer
+
+    delta_buf = np.empty_like(psi_1d)
     
     if phi is None:
         phi = 1.0; phi_updt = True
@@ -112,45 +129,37 @@ def mcmc(a, b, phi, sst_dict, n, ld_blk, blk_size, n_iter, n_burnin, thin, chrom
     psi_est = np.zeros((p,1))
     sigma_est = 0.0
     phi_est = 0.0
-
-    parpool = Parallel(n_jobs=n_jobs, backend="loky", prefer="processes")
     
     # MCMC
     pp = 0
     timer  = collections.Counter()
     counts = collections.Counter()
+
+    active   = [(k, r) for k, r in enumerate(idx_ranges) if blk_size[k]]
+    workers  = Parallel(n_jobs=n_jobs, backend="threading")       # persistent pool
+
     for itr in range(1,n_iter+1):
         loop_start = time.perf_counter()
-        # --- parallel block sampler -------------------
+        # -------- β-step: threaded executor, fused update --------------
         t0 = time.perf_counter()
-        active = [(k, r) for k, r in enumerate(idx_ranges) if blk_size[k] > 0]
-        results = parpool(
-                    delayed(_sample_block_wrapped)(block_state[k],
-                                        psi[r, 0],
-                                        beta_mrg[r],
-                                        sigma, 
-                                        n,
-                                        block_seed=(None if seed is None else seed + itr * 1_000_003 + k))
-                    for k, r in active
-                )
+        with threadpool_limits(limits=1, user_api="blas"):
+            results = workers(
+                delayed(_sample_block_fused)(block_state[k], psi_1d[r], sigma, n)
+                for k, r in active
+            )
+
         timer['beta'] += time.perf_counter() - t0
         counts['beta'] += 1
-        
-        if itr == 1:  # only on first iteration
-            backend = parallel.get_active_backend()[0]
-            print(f"[DBG] backend: {backend.__class__.__name__}, "
-                f"n_jobs={n_jobs}, non-empty blocks={len(active)}")
 
-        if itr % 1 == 0:
-            status_of_phi = "burning in" if itr < n_burnin else f"φ={float(phi_est):.3e}"
-            log.info('chr %d  started iteration %d of %d (%s)', chrom, itr, n_iter, status_of_phi)
-            print(f"[DEBUG] chr {chrom} completed iteration {itr} of {n_iter} with n_jobs={n_jobs} and non-empty blocks={len(active)}, {status_of_phi}")
+        if itr == 1:  # one-off banner so you know what backend you got
+            print(f"[DBG] using joblib threading backend with n_jobs={n_jobs} "
+                f"({len(active)} non-empty LD blocks)")
 
+        # unpack results ------------------------------------------------
         quad = 0.0
-        for (r, (beta_b, quad_b)) in zip([r for _, r in active], results):
+        for ((k, r), (beta_b, quad_b)) in zip(active, results):
             beta[r] = beta_b
             quad   += quad_b
-        # ----------------------------------------------------
 
         s1 = float((beta * beta_mrg).sum())
         s2 = float((beta**2 / psi).sum())
@@ -161,26 +170,30 @@ def mcmc(a, b, phi, sst_dict, n, ld_blk, blk_size, n_iter, n_burnin, thin, chrom
         # force sigma to be a Python float (not a 0-d array)
         sigma = float(1.0/np.random.gamma((n+p)/2.0, 1.0/err))
 
-        delta = np.random.gamma(a+b, 1.0/(psi+phi))
+        # delta = np.random.gamma(a+b, 1.0/(psi+phi))
+        np.add(psi_1d,   phi, out=delta_buf)         # δ_buf = ψ + φ
+        np.reciprocal(delta_buf,      out=delta_buf) # δ_buf = 1/(ψ+φ)
+        delta_buf[:] = np.random.gamma(a+b, delta_buf)   # fill in-place
+        delta = delta_buf                             # alias for clarity
 
         # ---------- ψ-update ----------
         t0 = time.perf_counter()
         gigrnd.gig_rvs_vec(
                 psi_1d,          # out
                 a - 0.5,
-                delta[:, 0],
+                delta,
                 beta_1d,
                 sigma,
                 n
         )
-        psi_1d[psi_1d > 1.0] = 1.0
+        np.minimum(psi_1d, 1.0, out=psi_1d)
         timer['psi'] += time.perf_counter() - t0
         counts['psi'] += 1
         # ------------------------------
 
         if phi_updt == True:
             w = np.random.gamma(1.0, 1.0/(phi+1.0))
-            phi = np.random.gamma(p*b+0.5, 1.0/(sum(delta)+w))
+            phi = np.random.gamma(p*b + 0.5, 1.0/(delta.sum() + w))
 
         # posterior
         if (itr>n_burnin) and (itr % thin == 0):
