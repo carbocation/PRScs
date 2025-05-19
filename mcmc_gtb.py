@@ -11,6 +11,7 @@ import numpy as np
 from scipy import linalg
 from joblib import Parallel, delayed
 from threadpoolctl import threadpool_limits
+from typing import Dict, List, Tuple, Sequence
 
 import time, collections
 
@@ -25,6 +26,11 @@ logging.basicConfig(
     force=True                           # overrides any prior config
 )
 log = logging.getLogger(__name__)
+
+# ─────────────────────── numeric safety guards ────────────────────────
+PSI_MIN   = 1e-8
+PSI_MAX   = 1e8
+SIGMA_MIN = 1e-8
 
 # ---------- helper for one LD block ----------
 def _sample_block_fused(state, psi_slice, sigma, n):
@@ -67,11 +73,21 @@ def _sample_block_fused(state, psi_slice, sigma, n):
 
     return beta_b.copy(), quad_b
 
+STATE: List[Dict] | None = None          # one global per process
+def _init_worker(shared_state: List[Dict]):
+    """Executed once in every child process."""
+    global STATE
+    STATE = shared_state
+
+def _loky_worker_body(k: int, psi_slice: np.ndarray, sigma: float, n: int):
+    """Small wrapper that pulls per-block state from the process-global."""
+    return _sample_block_fused(STATE[k], psi_slice, sigma, n)
+
 def mcmc(a, b, phi, sst_dict, n, ld_blk, blk_size, n_iter, n_burnin, thin, chrom, out_dir, beta_std, write_psi, write_pst, seed):
     print('... MCMC ...')
 
-    REBUILD_FREQ = 1000        # 0 ⇒ never rebuild
-    n_jobs = int(os.environ.get("PRSCS_N_JOBS", "1"))     # default: 1
+    n_jobs = int(os.environ.get("PRSCS_N_JOBS", "1"))  # default: 1
+    backend = os.getenv("PRSCS_BACKEND", "threading")  # default to threads
 
     # seed
     if seed is not None:
@@ -91,9 +107,12 @@ def mcmc(a, b, phi, sst_dict, n, ld_blk, blk_size, n_iter, n_burnin, thin, chrom
     # --- block index bookkeeping ---
     starts = np.cumsum([0] + blk_size[:-1])       # 0-based starts
     idx_ranges = [range(s, s + sz) for s, sz in zip(starts, blk_size)]
+    active   = [(k, r) for k, r in enumerate(idx_ranges) if blk_size[k]]
+
+    n_jobs = min(n_jobs, len(active))                  # Cap n_jobs at the number of non-empty blocks
 
     # --- persistent Cholesky state for every LD block -----------------
-    block_state = []
+    block_state: List[Dict | None] = []
     for k, r in enumerate(idx_ranges):
         m = blk_size[k]
         if m == 0:                     # empty block
@@ -102,25 +121,48 @@ def mcmc(a, b, phi, sst_dict, n, ld_blk, blk_size, n_iter, n_burnin, thin, chrom
 
         # keep factor in float64 for numerical headroom
         ld_sub = ld_blk[k].astype(np.float64, copy=False)
-        L0 = linalg.cholesky(ld_sub + np.eye(m), lower=True)
+        L0 = linalg.cholesky(ld_sub + np.eye(m), lower=True).copy(order='F')
 
-        state_dict = {
-            # constant per block ------------------------------------------------
-            'ld_blk'    : ld_sub,                 # fixed LD sub-matrix (float64)
-            'beta_mrg'  : beta_mrg[r].ravel(),    #  view on β̂ (length m)
-            'rng'       : np.random.default_rng(None if seed is None else seed + k),
+        block_state.append(
+            dict(
+                ld_blk     = ld_sub,
+                beta_mrg   = beta_mrg[r].ravel(),                 # view
+                rng        = np.random.default_rng(
+                                None if seed is None else seed + k
+                             ),
+                L          = L0,
+                diag_curr  = np.ones(m, dtype=np.float64),
+                invpsi     = np.empty(m, dtype=np.float64),
+                zbuf       = np.empty(m, dtype=np.float64),
+                work       = np.empty(m, dtype=np.float64),
+            )
+        )
+    
+    # ----------- choose backend --------------------------------------------
+    if backend == "threading":
+        blas_threads = 0 # use library default
+        workers = Parallel(n_jobs=n_jobs, backend="threading", prefer="threads")
+        def _submit(k, r):
+            return delayed(_sample_block_fused)(
+                block_state[k], psi_1d[r], sigma, n
+            )
+    elif backend == "loky":
+        blas_threads = 1
+        workers = Parallel(
+            n_jobs     = n_jobs,
+            backend    = "loky",
+            initializer= _init_worker,
+            initargs   = (block_state,),
+        )
+        def _submit(k, r):
+            return delayed(_loky_worker_body)(k, psi_1d[r], sigma, n)
+    else:
+        raise ValueError(f"backend must be 'threading' or 'loky' (got {backend!r})")
 
-            # mutable state -----------------------------------------------------
-            'L'         : L0,                     # current Cholesky factor
-            'diag_curr' : np.ones(m, dtype=np.float64),   # cached 1/ψ
-            'invpsi'    : np.empty(m, dtype=np.float64),
-            'zbuf'      : np.empty(m, dtype=np.float64),
-            'work'      : np.empty(m, dtype=np.float64),
-            'needs_rebuild' : False               # adaptive stability flag
-        }
-        block_state.append(state_dict)
+    # one-off banner
+    print(f"[DBG] backend={backend}  n_jobs={n_jobs}  active_blocks={len(active)}")
 
-    # initialization
+    # ----------- global arrays ---------------------------------------------
     beta = np.zeros((p,1))
     psi = np.ones((p,1))
     sigma = 1.0
@@ -136,8 +178,8 @@ def mcmc(a, b, phi, sst_dict, n, ld_blk, blk_size, n_iter, n_burnin, thin, chrom
     if write_pst == 'TRUE':
         beta_pst = np.zeros((p,n_pst))
 
-    beta_est = np.zeros((p,1))
-    psi_est = np.zeros((p,1))
+    beta_est  = np.zeros_like(beta)
+    psi_est   = np.zeros_like(psi)
     sigma_est = 0.0
     phi_est = 0.0
     
@@ -146,25 +188,21 @@ def mcmc(a, b, phi, sst_dict, n, ld_blk, blk_size, n_iter, n_burnin, thin, chrom
     timer  = collections.Counter()
     counts = collections.Counter()
 
-    active   = [(k, r) for k, r in enumerate(idx_ranges) if blk_size[k]]
-    workers  = Parallel(n_jobs=n_jobs, backend="loky", prefer="processes")       # persistent pool
-
     for itr in range(1,n_iter+1):
         loop_start = time.perf_counter()
         # -------- β-step: threaded executor, fused update --------------
         t0 = time.perf_counter()
-        with threadpool_limits(limits=1, user_api="blas"):
-            results = workers(
-                delayed(_sample_block_fused)(block_state[k], psi_1d[r], sigma, n)
+        if n_jobs == 1 or len(active) < 2:
+            # plain serial loop – fastest for 1 block
+            results = [
+                _sample_block_fused(block_state[k], psi_1d[r], sigma, n)
                 for k, r in active
-            )
-
+            ]
+        else:
+            with threadpool_limits(limits=blas_threads, user_api="blas"):
+                results = workers(_submit(k, r) for k, r in active)
         timer['beta'] += time.perf_counter() - t0
         counts['beta'] += 1
-
-        if itr == 1:  # one-off banner so you know what backend you got
-            print(f"[DBG] using joblib threading backend with n_jobs={n_jobs} "
-                f"({len(active)} non-empty LD blocks)")
 
         # unpack results ------------------------------------------------
         quad = 0.0
@@ -178,8 +216,10 @@ def mcmc(a, b, phi, sst_dict, n, ld_blk, blk_size, n_iter, n_burnin, thin, chrom
         e2 = float(n/2.0*s2)
         err = max(e1, e2)
 
+        # σ-step (robust scale)
+        scale = 1.0 / max(err, 1.0 / SIGMA_MIN)
         # force sigma to be a Python float (not a 0-d array)
-        sigma = float(1.0/np.random.gamma((n+p)/2.0, 1.0/err))
+        sigma = float(1.0 / np.random.gamma((n + p) / 2.0, scale))
 
         # ---------- ψ & δ  fused update  ----------
         t0 = time.perf_counter()
@@ -191,32 +231,17 @@ def mcmc(a, b, phi, sst_dict, n, ld_blk, blk_size, n_iter, n_burnin, thin, chrom
             sigma,
             n
         )
+        # np.clip(psi_1d, PSI_MIN, PSI_MAX, out=psi_1d)   # guard NaNs/∞
         timer['psi'] += time.perf_counter() - t0
         counts['psi'] += 1
         # ------------------------------
 
-        # ========== CHOLESKY REBUILD ==========
-        if REBUILD_FREQ and (itr % REBUILD_FREQ == 0):
-            rebuild_all = True
-        else:
-            rebuild_all = False
-        
-        for (k, r) in active:
-            if rebuild_all or block_state[k].get("needs_rebuild", False):
-                invpsi_blk = 1.0 / psi_1d[r]
-                L = block_state[k]["L"]
-                L[:] = linalg.cholesky(
-                    ld_blk[k] + np.diag(invpsi_blk.astype(np.float64)),
-                    lower=True
-                )
-                block_state[k]["diag_curr"][:] = invpsi_blk
-        # ========== END rebuild =========================
-
+        # (optional) φ-step
         if phi_updt == True:
             w = np.random.gamma(1.0, 1.0/(phi+1.0))
             phi = np.random.gamma(p*b + 0.5, 1.0/(delta_sum + w))
 
-        # posterior
+        # posterior means / samples
         if (itr>n_burnin) and (itr % thin == 0):
             beta_est = beta_est + beta/n_pst
             psi_est = psi_est + psi/n_pst
@@ -227,9 +252,9 @@ def mcmc(a, b, phi, sst_dict, n, ld_blk, blk_size, n_iter, n_burnin, thin, chrom
                 beta_pst[:,[pp]] = beta
                 pp += 1
         
+        # --- profiling banner ----
         timer['loop'] += time.perf_counter() - loop_start
         counts['loop'] += 1        # same as number of iterations
-        
         b  = timer['beta'] / max(counts['beta'], 1)
         ps = timer['psi']  / max(counts['psi'],  1)
         lo = timer['loop'] / max(counts['loop'], 1)

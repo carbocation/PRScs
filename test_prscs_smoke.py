@@ -11,30 +11,44 @@ from pathlib import Path
 # --- import the code under test -------------------------------------------
 from mcmc_gtb import mcmc
 
+def make_toy_inputs(p: int = 200, n_blocks: int = 4, rho: float = 0.9):
+    """
+    Create a toy dataset split into `n_blocks` contiguous LD blocks.
+    Each block gets its own correlation matrix; between-block LD is zero
+    (exactly what PRS-CS expects).
 
-def make_toy_inputs(p: int = 200):
-    """Return (sst_dict, ld_blocks, block_sizes) for a single-block toy run."""
+    Returns
+    -------
+    sst_dict   : GWAS summary stats (same as before)
+    ld_blocks  : list[np.ndarray]   – one LD matrix per block
+    block_sizes: list[int]          – sizes of the LD blocks
+    """
+    assert 1 <= n_blocks <= p, "`n_blocks` must be between 1 and p"
+
+    # ― summary statistics ---------------------------------------------------
     rng = np.random.default_rng(42)
 
     sst_dict = {
-        "SNP":  [f"rs{idx}"    for idx in range(p)],
-        "BP":   [idx + 1       for idx in range(p)],
+        "SNP":  [f"rs{idx}" for idx in range(p)],
+        "BP":   list(range(1, p + 1)),
         "A1":   ["A"] * p,
         "A2":   ["C"] * p,
-        "BETA": rng.standard_normal(p) * 0.01,          # tiny marginal effects
+        "BETA": rng.standard_normal(p) * 0.01,
         "MAF":  rng.uniform(0.05, 0.5, p),
     }
 
-    # simple LD matrix: exponential decay with distance
-    coords = np.arange(p)
-    dist   = np.abs(coords[:, None] - coords[None, :])
-    ld_mat = 0.9 ** dist                                   # ρ^|i-j|
+    # ― split p SNPs as evenly as possible -----------------------------------
+    base   = p // n_blocks
+    sizes  = [base] * n_blocks
+    sizes[-1] += p - base * n_blocks          # put any remainder in the last
 
-    ld_blocks  = [ld_mat.astype(np.float64)]
-    block_sizes = [p]
+    ld_blocks: list[np.ndarray] = []
+    for m in sizes:
+        coords = np.arange(m)
+        dist   = np.abs(coords[:, None] - coords[None, :])
+        ld_blocks.append((rho ** dist).astype(np.float64))
 
-    return sst_dict, ld_blocks, block_sizes
-
+    return sst_dict, ld_blocks, sizes
 
 def test_prscs_smoke():
     sst, ld_blk, blk_size = make_toy_inputs()
