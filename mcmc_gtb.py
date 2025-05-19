@@ -140,6 +140,9 @@ def mcmc(a, b, phi, sst_dict, n, ld_blk, blk_size, n_iter, n_burnin, thin, chrom
         # one deterministic RNG for this iteration (keeps reproducible across n_jobs)
         rng_iter = None if seed is None else np.random.default_rng(seed + itr * 2_000_033)
 
+        if itr == 1:
+            print("[DBG]", geninvgauss.rvs.__doc__.splitlines()[0])
+
         def draw_chunk(start, stop, rs):
             """Draw ψ for slice [start:stop)."""
             return geninvgauss.rvs(
