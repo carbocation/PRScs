@@ -9,12 +9,15 @@ import gigrnd
 
 import numpy as np
 from scipy import linalg
-from scipy.linalg import cholesky_update
 from joblib import Parallel, delayed
 import joblib
 from threadpoolctl import threadpool_limits
-
 import time, collections
+
+try:
+    from choldate import cholupdate, choldowndate # C-extension
+except ImportError:
+    cholupdate = choldowndate = None # triggers full Cholesky rebuild fallback
 
 import logging
 import os
@@ -30,57 +33,49 @@ log = logging.getLogger(__name__)
 
 # ---------- helper for one LD block ----------
 def _solve_with_cached_chol(chol, dinvt, beta_mrg_blk, sigma, n, rng):
-    """chol and dinvt are float32; beta_mrg_blk is float64."""
+    z   = rng.standard_normal(beta_mrg_blk.shape) * np.sqrt(sigma / n)
+    tmp = linalg.solve_triangular(chol, beta_mrg_blk, lower=True,  check_finite=False)
+    beta_b = linalg.solve_triangular(chol.T, tmp + z, lower=False, check_finite=False)
 
-    with threadpool_limits(limits=1,user_api="blas"):
-        beta_m32 = beta_mrg_blk.astype(np.float32, copy=False)
-
-        z   = rng.standard_normal(beta_m32.shape).astype(np.float32) * np.sqrt(sigma / n)
-        tmp = linalg.solve_triangular(chol, beta_m32, lower=True, check_finite=False)
-        beta_b_f32 = linalg.solve_triangular(chol.T, tmp + z, lower=False, check_finite=False)
-
-        quad_b = float(beta_b_f32.astype(np.float64).T @
-                    dinvt.astype(np.float64) @
-                    beta_b_f32.astype(np.float64))
-        return beta_b_f32, quad_b
+    quad_b = float(beta_b.T @ dinvt @ beta_b)
+    return beta_b, quad_b
 
 # ---- helper ----------------------------------------------------
-def _diag_chol_update(chol, dinvt, invdiag, delta):
-    """
-    Apply the change `delta` to the *diagonal* of D⁻¹ and update
-    the cached Cholesky factor `chol` in-place.
+def _diag_chol_update(chol: np.ndarray, dinvt: np.ndarray, invdiag: np.ndarray, delta: np.ndarray):
+    """Rank‑1 update/downdate of cached Cholesky factor after diagonal change.
 
     Parameters
     ----------
-    chol   : ndarray (m, m)  – lower-triangular Cholesky factor   (float32)
-    dinvt  : ndarray (m, m)  – cached D⁻¹                         (float32)
-    invdiag: ndarray (m,)    – cached diag(D⁻¹)                   (float32)
-    delta  : ndarray (m,)    – new − old diagonal                 (float32/64)
+    chol   : (m, m) float64 F‑order – lower‑triangular Cholesky factor of D⁻¹.
+    dinvt  : (m, m) float64 F‑order – cached D⁻¹ = R + diag(ψ⁻¹).
+    invdiag: (m,)   float64          – cached diag(D⁻¹).
+    delta  : (m,)   float64          – new_diag(D⁻¹) − old_diag(D⁻¹).
     """
     if not np.any(delta):
-        return                         # nothing to do
+        return  # nothing to do
 
-    # split signs because `sign` is scalar in scipy.linalg.cholesky_update
-    for sign_val, mask in ((+1, delta > 0), (-1, delta < 0)):
+    # ---------- fallback: full rebuild ----------
+    if cholupdate is None:
+        dinvt[np.diag_indices_from(dinvt)] += delta
+        invdiag[:] += delta
+        chol[:] = linalg.cholesky(dinvt, lower=True, check_finite=False)
+        return
+
+    # ---------- fast rank‑1 updates (choldate) ----------
+    for sign_val in (+1, -1):
+        mask = delta > 0 if sign_val > 0 else delta < 0
         if not np.any(mask):
             continue
-        cols = mask.sum()
-        # U has shape (m,  r), r = #diagonal elements of this sign
-        U = np.zeros((chol.shape[0], cols), dtype=chol.dtype, order='F')
         idx = np.nonzero(mask)[0]
-        U[idx, np.arange(cols)] = np.sqrt(np.abs(delta[mask]))
-        cholesky_update(
-            chol,
-            U,
-            lower=True,
-            overwrite_c=True,
-            check_finite=False,
-            sign=sign_val,
-        )
+        root = np.sqrt(np.abs(delta[mask]))  # float64
+        for i, r in zip(idx, root):
+            e_i = np.zeros(chol.shape[0], dtype=np.float64, order="F")
+            e_i[i] = r
+            (cholupdate if sign_val > 0 else choldowndate)(chol, e_i)
 
     # keep the caches consistent
-    dinvt[np.diag_indices_from(dinvt)] += delta.astype(dinvt.dtype)
-    invdiag[:] += delta.astype(invdiag.dtype)
+    dinvt[np.diag_indices_from(dinvt)] += delta
+    invdiag[:] += delta
 
 def mcmc(a, b, phi, sst_dict, n, ld_blk, blk_size, n_iter, n_burnin, thin, chrom, out_dir, beta_std, write_psi, write_pst, seed):
     print('... MCMC ...')
@@ -124,10 +119,10 @@ def mcmc(a, b, phi, sst_dict, n, ld_blk, blk_size, n_iter, n_burnin, thin, chrom
 
     chol_blk, invdiag_blk, dinvt_blk = [], [], []
     for k, r in enumerate(idx_ranges):
-        dinvt = ld_blk[k].astype(np.float32, copy=True)
+        dinvt = np.array(ld_blk[k], dtype=np.float64, order="F", copy=True)
         dinvt[np.diag_indices_from(dinvt)] += 1.0
         chol_blk.append(linalg.cholesky(dinvt, lower=True, check_finite=False))
-        invdiag_blk.append(np.ones(len(r), dtype=np.float32))
+        invdiag_blk.append(np.ones(len(r), dtype=np.float64))
         dinvt_blk.append(dinvt)
 
     parpool = Parallel(n_jobs=n_jobs, backend="threading", require="sharedmem")
@@ -173,8 +168,8 @@ def mcmc(a, b, phi, sst_dict, n, ld_blk, blk_size, n_iter, n_burnin, thin, chrom
         )
         # copy results back
         quad = 0.0
-        for (r, (beta_b_f32, quad_b)) in zip([r for _, r in active], results):
-            beta[r] = beta_b_f32.astype(np.float64)   # master β stays FP64
+        for (r, (beta_b, quad_b)) in zip([r for _, r in active], results):
+            beta[r] = beta_b.astype(np.float64)   # master β stays FP64
             quad   += quad_b
         
         timer['beta'] += time.perf_counter() - t0
