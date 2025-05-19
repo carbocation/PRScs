@@ -14,6 +14,8 @@ from joblib import Parallel, delayed
 from joblib import parallel
 from threadpoolctl import threadpool_limits
 
+import time, collections
+
 import logging
 import os
 import sys
@@ -81,10 +83,14 @@ def mcmc(a, b, phi, sst_dict, n, ld_blk, blk_size, n_iter, n_burnin, thin, chrom
 
     # MCMC
     pp = 0
+    timer  = collections.Counter()
+    counts = collections.Counter()
     for itr in range(1,n_iter+1):
+        loop_start = time.perf_counter()
         # --- parallel block sampler -------------------
         active = [(k, r) for k, r in enumerate(idx_ranges) if blk_size[k] > 0]
         with threadpool_limits(limits=1, user_api="blas"):   # lock BLAS to 1 thread
+            t0 = time.perf_counter()
             results = Parallel(n_jobs=n_jobs, backend="loky", prefer="processes", verbose=10)(
                         delayed(_sample_block)(ld_blk[k],
                                             psi[r, 0],
@@ -94,6 +100,8 @@ def mcmc(a, b, phi, sst_dict, n, ld_blk, blk_size, n_iter, n_burnin, thin, chrom
                                             block_seed=(None if seed is None else seed + itr * 1_000_003 + k))
                         for k, r in active
                     )
+            timer['beta'] += time.perf_counter() - t0
+            counts['beta'] += 1
         
         if itr == 1:  # only on first iteration
             backend = parallel.get_active_backend()[0]
@@ -127,6 +135,7 @@ def mcmc(a, b, phi, sst_dict, n, ld_blk, blk_size, n_iter, n_burnin, thin, chrom
         else:
             # one unique seed per iteration (no dependence on n_jobs)
             rng_psi = np.random.default_rng(seed + itr * 2_000_033)
+        t0 = time.perf_counter()
         psi[:, 0] = geninvgauss.rvs(
                     a - 0.5,                      # shape  p = a – ½
                     2.0 * delta.ravel(),          # scale  b = 2 δⱼ
@@ -134,6 +143,8 @@ def mcmc(a, b, phi, sst_dict, n, ld_blk, blk_size, n_iter, n_burnin, thin, chrom
                     size  = p,                     # draw p values
                     random_state = rng_psi
                 )
+        timer['psi'] += time.perf_counter() - t0
+        counts['psi'] += 1
         psi[psi > 1.0] = 1.0
         # ---------------------------------------------------------
 
@@ -151,6 +162,16 @@ def mcmc(a, b, phi, sst_dict, n, ld_blk, blk_size, n_iter, n_burnin, thin, chrom
             if write_pst == 'TRUE':
                 beta_pst[:,[pp]] = beta
                 pp += 1
+        
+        timer['loop'] += time.perf_counter() - loop_start
+        counts['loop'] += 1        # same as number of iterations
+        
+        b  = timer['beta'] / max(counts['beta'], 1)
+        ps = timer['psi']  / max(counts['psi'],  1)
+        lo = timer['loop'] / max(counts['loop'], 1)
+        print(f"[PROFILE chr{chrom}] iter {itr:4d} | "
+            f"β {b:6.3f}s  ψ {ps:6.3f}s  other {lo-b-ps:6.3f}s "
+            f"(tot {lo:6.3f}s)")
 
     # convert standardized beta to per-allele beta
     if beta_std == 'FALSE':
