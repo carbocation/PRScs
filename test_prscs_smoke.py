@@ -52,8 +52,8 @@ def test_prscs_smoke():
         n           = 1_000,        # synthetic sample size
         ld_blk      = ld_blk,
         blk_size    = blk_size,
-        n_iter      = 10,
-        n_burnin    = 2,
+        n_iter      = 2000,
+        n_burnin    = 200,
         thin        = 1,
         chrom       = 22,
         out_dir     = str(out_prefix),

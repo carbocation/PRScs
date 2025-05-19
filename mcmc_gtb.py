@@ -28,41 +28,49 @@ log = logging.getLogger(__name__)
 
 # ---------- helper for one LD block ----------
 def _sample_block_fused(state, psi_slice, sigma, n):
-    """
-      • computes 1/ψ inside the worker (parallel)
-      • no external RNG contention
-    """
-    L         = state["L"]
-    diag_o    = state["diag_curr"]
-    y0        = state["y0"]
+    # ─ aliases ───────────────────────────────────────────────────────
+    L         = state["L"]                # float64 factor
+    diag_o    = state["diag_curr"]        # float64 1/ψ cache
+    beta_mrg  = state["beta_mrg"]
     invpsi    = state["invpsi"]
-    rng       = state["rng"]
     zbuf      = state["zbuf"]
+    work      = state["work"]
+    rng       = state["rng"]
 
-    # zero-allocation
+    # 1 ─ z draw
     rng.standard_normal(out=zbuf)
-    zbuf *= (sigma/n)**0.5
+    zbuf *= (sigma / n) ** 0.5
 
-    # ── 1/ψ overwrite (cheap, runs in worker) ────────────────────────
-    np.reciprocal(psi_slice, out=invpsi) # zero-alloc
+    # 2 ─ fast diagonal update (Numba)
+    np.reciprocal(psi_slice, out=invpsi)        # invpsi = 1/ψ   (float64 view)
+    unsafe = gigrnd.chol_diag_update_safe_nb(L, diag_o, invpsi)
 
-    # ── in-place diagonal update ─────────────────────────────────────
-    gigrnd.chol_diag_update_inplace(L, diag_o, invpsi)
-    diag_o[:] = invpsi                              # keep book-keeping
+    if unsafe:
+        # one-off full rebuild in float64
+        L[:] = linalg.cholesky(
+            state["ld_blk"] + np.diag(invpsi),
+            lower=True
+        )
+        diag_o[:] = invpsi                      # sync cache
 
-    # ── Gibbs draw for β  (only ONE triangular solve) ───────────────
-    # beta_b = linalg.solve_triangular(L, y0 + zbuf, lower=True)
-    rhs = y0 + zbuf                  # no copy, just view addition
-    beta_b = linalg.blas.dtrsv(L, rhs, lower=1)   # in-place overwrite of rhs
+    # 3 ─ y = Lᵀ⁻¹ β̂
+    work[:] = beta_mrg
+    linalg.blas.dtrsv(L, work, lower=1, trans=1, overwrite_x=1)
 
-    tmp = linalg.blas.dtrmv(L, beta_b, lower=1, trans=1)   # y = Lᵀ β
-    quad_b  = float(tmp @ tmp)                        # BLAS dot
+    # 4 ─ β = L⁻¹ (y + z)
+    work += zbuf
+    beta_b = linalg.blas.dtrsv(L, work, lower=1, trans=0, overwrite_x=1)
 
-    return beta_b, quad_b
+    # 5 ─ quad_b
+    tmp    = linalg.blas.dtrmv(L, beta_b, lower=1, trans=1)
+    quad_b = float(tmp @ tmp)
+
+    return beta_b.copy(), quad_b
 
 def mcmc(a, b, phi, sst_dict, n, ld_blk, blk_size, n_iter, n_burnin, thin, chrom, out_dir, beta_std, write_psi, write_pst, seed):
     print('... MCMC ...')
 
+    REBUILD_FREQ = 1000        # 0 ⇒ never rebuild
     n_jobs = int(os.environ.get("PRSCS_N_JOBS", "1"))     # default: 1
 
     # seed
@@ -87,22 +95,28 @@ def mcmc(a, b, phi, sst_dict, n, ld_blk, blk_size, n_iter, n_burnin, thin, chrom
     # --- persistent Cholesky state for every LD block -----------------
     block_state = []
     for k, r in enumerate(idx_ranges):
-        if blk_size[k] == 0:                # empty block
+        m = blk_size[k]
+        if m == 0:                     # empty block
             block_state.append(None)
             continue
-        L0 = linalg.cholesky(ld_blk[k] + np.eye(blk_size[k]), lower=True)
-        y0 = linalg.solve_triangular(      # ← pre-compute Lᵀ \ β_marg
-                L0.T,
-                beta_mrg[r],
-                lower=False
-        ).ravel()                      # ← flatten to shape (m,)
-        state_dict={
-            'L': L0,                                           # current Cholesky factor
-            "diag_curr": np.ones(blk_size[k], dtype=L0.dtype), # current 1/ψ (starts at 1)
-            "y0"       : y0,                                   # cached solve
-            "invpsi"   : np.empty(blk_size[k], dtype=L0.dtype),       # scratch (re-used each iter)
-            "zbuf"     : np.empty_like(y0),
-            "rng"      : np.random.default_rng(None if seed is None else seed + k)
+
+        # keep factor in float64 for numerical headroom
+        ld_sub = ld_blk[k].astype(np.float64, copy=False)
+        L0 = linalg.cholesky(ld_sub + np.eye(m), lower=True)
+
+        state_dict = {
+            # constant per block ------------------------------------------------
+            'ld_blk'    : ld_sub,                 # fixed LD sub-matrix (float64)
+            'beta_mrg'  : beta_mrg[r].ravel(),    #  view on β̂ (length m)
+            'rng'       : np.random.default_rng(None if seed is None else seed + k),
+
+            # mutable state -----------------------------------------------------
+            'L'         : L0,                     # current Cholesky factor
+            'diag_curr' : np.ones(m, dtype=np.float64),   # cached 1/ψ
+            'invpsi'    : np.empty(m, dtype=np.float64),
+            'zbuf'      : np.empty(m, dtype=np.float64),
+            'work'      : np.empty(m, dtype=np.float64),
+            'needs_rebuild' : False               # adaptive stability flag
         }
         block_state.append(state_dict)
 
@@ -180,6 +194,23 @@ def mcmc(a, b, phi, sst_dict, n, ld_blk, blk_size, n_iter, n_burnin, thin, chrom
         timer['psi'] += time.perf_counter() - t0
         counts['psi'] += 1
         # ------------------------------
+
+        # ========== CHOLESKY REBUILD ==========
+        if REBUILD_FREQ and (itr % REBUILD_FREQ == 0):
+            rebuild_all = True
+        else:
+            rebuild_all = False
+        
+        for (k, r) in active:
+            if rebuild_all or block_state[k].get("needs_rebuild", False):
+                invpsi_blk = 1.0 / psi_1d[r]
+                L = block_state[k]["L"]
+                L[:] = linalg.cholesky(
+                    ld_blk[k] + np.diag(invpsi_blk.astype(np.float64)),
+                    lower=True
+                )
+                block_state[k]["diag_curr"][:] = invpsi_blk
+        # ========== END rebuild =========================
 
         if phi_updt == True:
             w = np.random.gamma(1.0, 1.0/(phi+1.0))

@@ -166,28 +166,28 @@ def psi_update_fused(psi, a, b, phi, beta, sigma, n):
 
     return delta_sum
 
-@njit(fastmath=True, cache=True)
-def chol_diag_update_inplace(L, diag_old, diag_new):
+@njit(cache=True, fastmath=True)
+def chol_diag_update_safe_nb(L, diag_curr, invpsi_new):
     """
-    In-place update of a lower-triangular Cholesky factor so that
+    Seeger rank-1 updates in float64 with an early-exit safety flag.
 
-        L Lᵀ = A_old                (on entry)
-        L Lᵀ = A_old + diag(δ)      (on exit),  where δ = diag_new – diag_old
-
-    Both diag_old and diag_new are length-n 1-D arrays holding the diagonal
-    of A_old and A_new.  Works because each δᵢ eᵢeᵢᵀ is a rank-1 update.
+    Returns
+    -------
+    unsafe : int   (0 = all good, 1 = pivot became non-positive)
     """
-    n = L.shape[0]
+    n = diag_curr.size
     for i in range(n):
-        delta = diag_new[i] - diag_old[i]
+        delta = invpsi_new[i] - diag_curr[i]
         if delta == 0.0:
-            continue                 # nothing to do for this row/col
-
-        Lii_old = L[i, i]
-        Lii_new = (Lii_old**2 + delta) ** 0.5   # r  in the Seeger algorithm
-        c = Lii_new / Lii_old                  # cos
+            continue
+        new_piv2 = L[i, i] * L[i, i] + delta
+        if new_piv2 <= 1e-12 or new_piv2 != new_piv2:   # <=0 or NaN
+            return 1                                   # unsafe
+        Liinew = new_piv2 ** 0.5
+        c = Liinew / L[i, i]
         if i + 1 < n:
-            for j in range(i + 1, n):          # scale the column below i
+            for j in range(i + 1, n):
                 L[j, i] /= c
-        L[i, i] = Lii_new
-        diag_old[i] = diag_new[i]              # keep book
+        L[i, i] = Liinew
+        diag_curr[i] = invpsi_new[i]
+    return 0
