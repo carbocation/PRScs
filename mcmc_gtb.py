@@ -127,8 +127,8 @@ def mcmc(a, b, phi, sst_dict, n, ld_blk, blk_size, n_iter, n_burnin, thin, chrom
             """Draw ψ for slice [start:stop)."""
             return geninvgauss.rvs(
                 a - 0.5,
-                2.0 * delta[start:stop],
-                scale = sigma / (n * (beta[start:stop] ** 2)),
+                2.0 * delta[start:stop, 0],
+                scale = sigma / (n * (delta[start:stop, 0] ** 2)),
                 size  = stop - start,
                 random_state = rs
             )
