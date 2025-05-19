@@ -114,8 +114,8 @@ def mcmc(a, b, phi, sst_dict, n, ld_blk, blk_size, n_iter, n_burnin, thin, chrom
                 f"n_jobs={n_jobs}, non-empty blocks={len(active)}")
 
         if itr % 1 == 0:
-            log.info('chr %d  started iteration %d of %d', chrom, itr, n_iter)
-            print(f"[DEBUG] chr {chrom} completed iteration {itr} of {n_iter} with n_jobs={n_jobs} and non-empty blocks={len(active)}")
+            log.info('chr %d  started iteration %d of %d (φ={%.3e})', chrom, itr, n_iter, phi_est)
+            print(f"[DEBUG] chr {chrom} completed iteration {itr} of {n_iter} with n_jobs={n_jobs} and non-empty blocks={len(active)}, φ={phi_est:.3e}")
 
         quad = 0.0
         for (r, (beta_b, quad_b)) in zip([r for _, r in active], results):
