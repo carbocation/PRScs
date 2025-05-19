@@ -35,48 +35,67 @@ SIGMA_MIN = 1e-8
 # ---------- helper for one LD block ----------------------------------
 def _sample_block_fused(state, psi_slice, sigma, n):
     """
-    Draw β for one LD block and return (β_block, quadratic form).
+    Draw β for one LD block *and* return (β_block, quadratic form).
 
-    Matches the current `block_state`:
+    Matches the current `block_state` layout:
         ld_blk, beta_mrg, rng, L, diag_curr, invpsi, zbuf, work
     """
     # ─ aliases --------------------------------------------------------
-    L        = state["L"]          # (m×m) lower-tri Cholesky
-    diag_o   = state["diag_curr"]  # cached 1/ψ  (length-m)
+    L        = state["L"]          # (m×m) lower-tri Cholesky – modified in-place
+    diag_o   = state["diag_curr"]  # cached invψ (length-m)
     beta_mrg = state["beta_mrg"]   # marginal β̂  (length-m)
-    invpsi   = state["invpsi"]     # work (length-m)
-    zbuf     = state["zbuf"]       # work (length-m)
+    invpsi   = state["invpsi"]     # scratch (length-m)
+    zbuf     = state["zbuf"]       # scratch (length-m)
     rng      = state["rng"]
 
-    # 1 ─ z  ~  N(0, σ/n · I)
+    # 0 ─── robust ψ sanitisation (handles NaN/Inf before the reciprocal)
+    np.nan_to_num(psi_slice,
+                  copy=False,
+                  nan=1.0,
+                  posinf=PSI_MAX,
+                  neginf=PSI_MIN)
+    np.clip(psi_slice, PSI_MIN, PSI_MAX, out=psi_slice)
+
+    # 1 ─── z  ←  N(0, σ/n · I)
     rng.standard_normal(out=zbuf)
     zbuf *= (sigma / n) ** 0.5
 
-    # 2 ─ robust diagonal update of the Cholesky factor
-    np.reciprocal(np.clip(psi_slice, PSI_MIN, PSI_MAX), out=invpsi)
-    unsafe = gigrnd.chol_diag_update_safe_nb(L, diag_o, invpsi)
+    # 2 ─── incremental diagonal update of the cached Cholesky factor
+    np.reciprocal(psi_slice, out=invpsi)                 # invψₙₑw
+    try:
+        unsafe = gigrnd.chol_diag_update_safe_nb(L, diag_o, invpsi)
+    except ZeroDivisionError:
+        # A pivot collapsed all the way to zero inside the rank-1 update.
+        # Mark as *unsafe* so we rebuild from scratch below.
+        unsafe = 1
+
     if unsafe or not np.isfinite(L).all():
+        # Fallback: full (and robust) Cholesky rebuild
         try:
             A = state["ld_blk"] + np.diag(invpsi)
             L[:] = linalg.cholesky(A, lower=True, check_finite=False)
-            diag_o[:] = invpsi
+            diag_o[:] = invpsi                     # keep cache coherent
         except linalg.LinAlgError:
             log.error("Cholesky rebuild failed – zeroing this block.")
             return np.zeros_like(beta_mrg), 0.0
     else:
-        diag_o[:] = invpsi  # keep cache coherent
+        diag_o[:] = invpsi                         # cache stays coherent
 
-    # 3 ─ y = Lᵀ⁻¹ β̂
-    y = linalg.solve_triangular(
-        L, beta_mrg, lower=True, trans='T', check_finite=False
-    )
+    # 3 ─── y = Lᵀ⁻¹ β̂
+    y = linalg.solve_triangular(L,
+                                beta_mrg,
+                                lower=True,
+                                trans='T',
+                                check_finite=False)
 
-    # 4 ─ β = L⁻¹ (y + z)
-    beta_b = linalg.solve_triangular(
-        L, y + zbuf, lower=True, trans='N', check_finite=False
-    )
+    # 4 ─── β = L⁻¹ (y + z)
+    beta_b = linalg.solve_triangular(L,
+                                     y + zbuf,
+                                     lower=True,
+                                     trans='N',
+                                     check_finite=False)
 
-    # 5 ─ quadratic form  βᵀL Lᵀβ   ( = || Lᵀβ ||² )
+    # 5 ─── quadratic form  βᵀ (L Lᵀ) β   ==  ||Lᵀ β||²
     Lt_beta = L.T @ beta_b
     quad_b  = float(Lt_beta @ Lt_beta)
 

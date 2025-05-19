@@ -140,7 +140,7 @@ def gigrnd(p, a, b):
     rnd = rnd/math.sqrt(a/b)
     return rnd
 
-@njit(fastmath=True, cache=True)
+@njit(fastmath=False, cache=True)
 def psi_update_fused(
     psi: np.ndarray,  # (p,)
     a_hyper: float,
@@ -184,34 +184,66 @@ def psi_update_fused(
 
     return delta_sum
 
-@njit(cache=True, fastmath=True)
+@njit(cache=True, fastmath=False)
 def _chol_rank1_inplace(L: np.ndarray, x: np.ndarray, sign: float) -> int:  # noqa: N803
-    """In-place rank-1 Cholesky update/downdate.
-
-    Returns 0 on success, 1 if the proposed step would break SPD-ness.
-    """
     m: int = x.size
     for k in range(m):
         Lkk: float = L[k, k]
         if Lkk <= L_PIVOT_MIN:
-            return 1  # would create non‑SPD matrix
-
-        xk: float = x[k]
-        if sign < 0.0 and abs(xk) >= Lkk:
             return 1
 
-        r_: float = math.sqrt(Lkk * Lkk + sign * xk * xk)
+        xk: float = x[k]
+
+        if sign < 0.0 and abs(xk) >= Lkk:
+            return 1
+        
+        # Original calculation of r_
+        # r_ = math.sqrt(Lkk * Lkk + sign * xk * xk)
+        # If Lkk*Lkk + sign*xk*xk is negative (e.g. downdate abs(xk)>Lkk and guard failed)
+        # math.sqrt would raise ValueError. Let's be more explicit for stability.
+        val_insidesqrt = Lkk * Lkk + sign * xk * xk
+        if val_insidesqrt < 0.0:
+             # This should ideally be caught by "abs(xk) >= Lkk" for downdates if Lkk > 0
+             # unless floating point artifacts with fastmath occur.
+            return 1 # Unstable: attempt to take sqrt of negative
+
+        r_: float = math.sqrt(val_insidesqrt)
+
+        # Lkk is guaranteed > L_PIVOT_MIN here.
+        # If r_ is 0, it means val_insidesqrt was 0.
+        # This implies Lkk*Lkk = -sign*xk*xk.
+        # If sign=1, Lkk=0 and xk=0 (Lkk=0 caught by L_PIVOT_MIN).
+        # If sign=-1, Lkk*Lkk = xk*xk, so abs(Lkk)=abs(xk). This should be caught by the abs(xk)>=Lkk guard.
+        # If it wasn't caught, and r_ is 0, then c_ will be 0.
+        if r_ == 0.0 and Lkk > L_PIVOT_MIN : # Check Lkk > L_PIVOT_MIN again for strictness, though implied
+            # If r_ is 0 and Lkk is not, c_ will be 0.
+            # This situation implies an issue not caught by previous guards, possibly due to fastmath.
+            # If any x[j] for j > k is non-zero, or if Ljk_old is non-zero and s_ is non-zero,
+            # then division by c_=0 will occur if the k+1 < m block is entered.
+            # To be safe, if r_ == 0 and Lkk !=0 (which means c_ will be 0), treat as unstable if c_ is to be used as divisor.
+            # The only case where c_=0 might be "fine" is if the k+1 block is not entered or x[j] and Ljk_old make the numerator zero.
+            # It's safer to consider r_=0 (and Lkk !=0) as unstable here.
+            if k + 1 < m: # If c_ would be used as a divisor
+                return 1 # Unstable, c_ would be zero
+
+        # Fallback for Lkk being exactly zero if it somehow passed L_PIVOT_MIN (unlikely)
+        if Lkk == 0.0: # This path should not be taken given L_PIVOT_MIN check
+             return 1
+
         c_: float = r_ / Lkk
         s_: float = xk / Lkk
+        
         L[k, k] = r_
         if k + 1 < m:
+            if c_ == 0.0: # Final explicit check before division
+                return 1 # Division by zero would occur
             for j in range(k + 1, m):
                 Ljk_old: float = L[j, k]
                 L[j, k] = (Ljk_old + sign * s_ * x[j]) / c_
                 x[j] = c_ * x[j] - s_ * Ljk_old
     return 0
 
-@njit(cache=True, fastmath=True)
+@njit(cache=True, fastmath=False)
 def chol_diag_update_safe_nb(
     L: np.ndarray,
     diag_curr: np.ndarray,
