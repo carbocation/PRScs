@@ -11,6 +11,7 @@ import numpy as np
 from scipy import linalg
 from scipy.stats import geninvgauss
 from joblib import Parallel, delayed
+from joblib import parallel
 
 import logging
 import os
@@ -80,9 +81,14 @@ def mcmc(a, b, phi, sst_dict, n, ld_blk, blk_size, n_iter, n_burnin, thin, chrom
     # MCMC
     pp = 0
     for itr in range(1,n_iter+1):
+        if itr == 1:  # only on first iteration
+            backend = parallel.get_active_backend()[0]
+            print(f"[DBG] backend: {backend.__class__.__name__}, "
+                f"n_jobs={n_jobs}, non-empty blocks={len(active)}")
+            
         # --- parallel block sampler -------------------
         active = [(k, r) for k, r in enumerate(idx_ranges) if blk_size[k] > 0]
-        results = Parallel(n_jobs=n_jobs, backend="loky", prefer="processes")(
+        results = Parallel(n_jobs=n_jobs, backend="loky", prefer="processes", verbose=10)(
                     delayed(_sample_block)(ld_blk[k],
                                         psi[r, 0],
                                         beta_mrg[r],

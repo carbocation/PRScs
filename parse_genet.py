@@ -8,6 +8,7 @@ Parse the reference panel, summary statistics, and validation set.
 
 import os
 import numpy as np
+import pickle
 from scipy.stats import norm
 from scipy import linalg
 import h5py
@@ -208,6 +209,13 @@ def parse_ldblk(ldblk_dir, sst_dict, chrom):
             mm += len(idx)
         else:
             ld_blk[blk] = np.array([])
+    
+    try:
+        pickle.dumps(ld_blk[0], protocol=pickle.HIGHEST_PROTOCOL)
+        print("[DBG] first LD block pickles fine, size",
+            ld_blk[0].nbytes / 1024**2, "MB")
+    except Exception as e:
+        print("[DBG] pickling first LD block failed:", e)
 
     return ld_blk, blk_size
 
