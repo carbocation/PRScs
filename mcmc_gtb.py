@@ -147,7 +147,7 @@ def mcmc(a, b, phi, sst_dict, n, ld_blk, blk_size, n_iter, n_burnin, thin, chrom
     counts = collections.Counter()
 
     active   = [(k, r) for k, r in enumerate(idx_ranges) if blk_size[k]]
-    workers  = Parallel(n_jobs=n_jobs, backend="threading")       # persistent pool
+    workers  = Parallel(n_jobs=n_jobs, backend="loky", prefer="processes")       # persistent pool
 
     for itr in range(1,n_iter+1):
         loop_start = time.perf_counter()
