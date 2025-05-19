@@ -126,18 +126,45 @@ def gigrnd(p, a, b):
     return rnd
 
 @njit(parallel=True, fastmath=True, cache=True)
-def gig_rvs_vec(out, a_minus_half, delta, beta, sigma, n):
+def psi_update_fused(psi, a, b, phi, beta, sigma, n):
     """
-    Fill `out` (1-D float64 array) with GIG draws in parallel.
-    Each element uses the scalar `gigrnd` already defined above.
+    In-place update of ψ *and* latent δ in a single pass.
+
+        δ_j  ~  Ga(a + b,   1 / (ψ_j + φ))
+        ψ_j' ~  GIG(a − ½,  2 δ_j,   n·β_j² / σ)
+
+    Returns
+    -------
+    delta_sum : float
+        ∑_j δ_j  — needed for the global-φ Gibbs step.
+
+    Notes
+    -----
+    * Keeps exactly the same Gibbs conditionals as PRS-CS.
+    * Eliminates the extra δ-array and the second loop over p SNPs.
     """
-    p = out.size
+    p = psi.size
+    delta_sum = 0.0
+    a_minus_half = a - 0.5
+
     for j in prange(p):
-        out[j] = gigrnd(
-            a_minus_half,
-            2.0 * delta[j],
-            n * (beta[j] * beta[j]) / sigma
-        )
+        # ── draw δ_j ─────────────────────────────────────────
+        scale = 1.0 / (psi[j] + phi)            # 1 / (ψ + φ)
+        delta_j = np.random.gamma(a + b, scale)
+
+        # ── draw ψ_j using the Devroye sampler ──────────────
+        psi_j = gigrnd(a_minus_half,
+                       2.0 * delta_j,
+                       n * (beta[j] * beta[j]) / sigma)
+
+        # soft upper-clip (matches original code)
+        if psi_j > 1.0:
+            psi_j = 1.0
+        psi[j] = psi_j
+
+        delta_sum += delta_j
+
+    return delta_sum
 
 @njit(fastmath=True, cache=True)
 def chol_diag_update_inplace(L, diag_old, diag_new):

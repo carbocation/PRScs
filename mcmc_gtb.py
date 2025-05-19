@@ -9,7 +9,7 @@ import gigrnd
 
 import numpy as np
 from scipy import linalg
-from joblib import Parallel, delayed, parallel_backend
+from joblib import Parallel, delayed
 from threadpoolctl import threadpool_limits
 
 import time, collections
@@ -29,7 +29,6 @@ log = logging.getLogger(__name__)
 # ---------- helper for one LD block ----------
 def _sample_block_fused(state, psi_slice, sigma, n):
     """
-    Same as before but:
       • computes 1/ψ inside the worker (parallel)
       • no external RNG contention
     """
@@ -92,11 +91,11 @@ def mcmc(a, b, phi, sst_dict, n, ld_blk, blk_size, n_iter, n_burnin, thin, chrom
             block_state.append(None)
             continue
         L0 = linalg.cholesky(ld_blk[k] + np.eye(blk_size[k]), lower=True)
-        y0  = linalg.solve_triangular(  # ← pre-compute Lᵀ \ β_marg
-                L0.T,                   # (does **not** change with ψ)
+        y0 = linalg.solve_triangular(      # ← pre-compute Lᵀ \ β_marg
+                L0.T,
                 beta_mrg[r],
                 lower=False
-        )
+        ).ravel()                      # ← flatten to shape (m,)
         state_dict={
             'L': L0,                                           # current Cholesky factor
             "diag_curr": np.ones(blk_size[k], dtype=L0.dtype), # current 1/ψ (starts at 1)
@@ -114,8 +113,6 @@ def mcmc(a, b, phi, sst_dict, n, ld_blk, blk_size, n_iter, n_burnin, thin, chrom
 
     beta_1d = beta[:, 0]    # view – updates automatically
     psi_1d  = psi[:, 0]     # view – output buffer
-
-    delta_buf = np.empty_like(psi_1d)
     
     if phi is None:
         phi = 1.0; phi_updt = True
@@ -158,7 +155,7 @@ def mcmc(a, b, phi, sst_dict, n, ld_blk, blk_size, n_iter, n_burnin, thin, chrom
         # unpack results ------------------------------------------------
         quad = 0.0
         for ((k, r), (beta_b, quad_b)) in zip(active, results):
-            beta[r] = beta_b
+            beta_1d[r] = beta_b
             quad   += quad_b
 
         s1 = float((beta * beta_mrg).sum())
@@ -170,30 +167,23 @@ def mcmc(a, b, phi, sst_dict, n, ld_blk, blk_size, n_iter, n_burnin, thin, chrom
         # force sigma to be a Python float (not a 0-d array)
         sigma = float(1.0/np.random.gamma((n+p)/2.0, 1.0/err))
 
-        # delta = np.random.gamma(a+b, 1.0/(psi+phi))
-        np.add(psi_1d,   phi, out=delta_buf)         # δ_buf = ψ + φ
-        np.reciprocal(delta_buf,      out=delta_buf) # δ_buf = 1/(ψ+φ)
-        delta_buf[:] = np.random.gamma(a+b, delta_buf)   # fill in-place
-        delta = delta_buf                             # alias for clarity
-
-        # ---------- ψ-update ----------
+        # ---------- ψ & δ  fused update  ----------
         t0 = time.perf_counter()
-        gigrnd.gig_rvs_vec(
-                psi_1d,          # out
-                a - 0.5,
-                delta,
-                beta_1d,
-                sigma,
-                n
+        delta_sum = gigrnd.psi_update_fused(
+            psi_1d,          # ψ is updated in-place
+            a, b,
+            phi,
+            beta_1d,
+            sigma,
+            n
         )
-        np.minimum(psi_1d, 1.0, out=psi_1d)
         timer['psi'] += time.perf_counter() - t0
         counts['psi'] += 1
         # ------------------------------
 
         if phi_updt == True:
             w = np.random.gamma(1.0, 1.0/(phi+1.0))
-            phi = np.random.gamma(p*b + 0.5, 1.0/(delta.sum() + w))
+            phi = np.random.gamma(p*b + 0.5, 1.0/(delta_sum + w))
 
         # posterior
         if (itr>n_burnin) and (itr % thin == 0):
@@ -236,7 +226,7 @@ def mcmc(a, b, phi, sst_dict, n, ld_blk, blk_size, n_iter, n_burnin, thin, chrom
                 ff.write(('%d\t%s\t%d\t%s\t%s' + '\t%.6e'*n_pst + '\n') % (chrom, snp, bp, a1, a2, *beta))
         else:
             for snp, bp, a1, a2, beta in zip(sst_dict['SNP'], sst_dict['BP'], sst_dict['A1'], sst_dict['A2'], beta_est):
-                ff.write('%d\t%s\t%d\t%s\t%s\t%.6e\n' % (chrom, snp, bp, a1, a2, beta))
+                ff.write('%d\t%s\t%d\t%s\t%s\t%.6e\n' % (chrom, snp, bp, a1, a2, float(beta.item())))
 
     # write posterior estimates of psi
     if write_psi == 'TRUE':
@@ -247,7 +237,7 @@ def mcmc(a, b, phi, sst_dict, n, ld_blk, blk_size, n_iter, n_burnin, thin, chrom
 
         with open(psi_file, 'w') as ff:
             for snp, psi in zip(sst_dict['SNP'], psi_est):
-                ff.write('%s\t%.6e\n' % (snp, psi))
+                ff.write('%s\t%.6e\n' % (snp, float(psi.item())))
 
     # print estimated phi
     if phi_updt == True:
