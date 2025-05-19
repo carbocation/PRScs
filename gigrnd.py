@@ -162,22 +162,20 @@ def psi_update_fused(psi, a, b, phi, beta, sigma, n):
 def _chol_rank1_inplace(L, x, sign):
     """
     In-place rank-1 Cholesky update/downdate.
-
-    Parameters
-    ----------
-    L    : lower-triangular (m×m) float64 array, ON ENTRY a valid chol factor.
-           ON EXIT satisfies  L Lᵀ = A + sign·x xᵀ.
-    x    : length-m work vector (will be overwritten)
-    sign : +1.0 for update, -1.0 for downdate   (must keep A SPD!)
-
-    Returns 0 on success, 1 if a downdate would destroy SPD.
+    Returns 0 on success, 1 if the step would make A non-SPD.
     """
     m = x.size
     for k in range(m):
         Lkk = L[k, k]
-        xk  = x[k]
-        if sign < 0.0 and abs(xk) >= Lkk:      # would make pivot ≤0
+
+        # ─── refuse to touch near-zero pivots ──────────────────
+        if Lkk <= L_PIVOT_MIN:      # L_PIVOT_MIN
+            return 1                # caller will rebuild from scratch
+
+        xk = x[k]
+        if sign < 0.0 and abs(xk) >= Lkk:      # classic SPD test
             return 1
+
         r = math.sqrt(Lkk*Lkk + sign*xk*xk)
         c = r / Lkk
         s = xk / Lkk
