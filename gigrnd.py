@@ -12,6 +12,13 @@ import math
 import numpy as np
 from numba import njit, prange
 
+GIG_MIN = 1e-300          # > 0   (avoids divide-by-zero)
+GIG_MAX = 1e+150          # << exp(709)   (avoids overflow)
+DELTA_VALUE_MAX = 1.0e4   # refuse extreme updates
+
+L_PIVOT_MIN = 1e-10      # absolute   (≈ 10 × ε for 64-bit)
+REL_TOL     = 1e-4       # relative   (reject delta_value that kills ≥ 99.99 % of a pivot)
+
 @njit(cache=True)
 def psi(x, alpha, lam):
     f = -alpha*(math.cosh(x)-1.0)-lam*(math.exp(x)-x-1.0)
@@ -127,67 +134,106 @@ def gigrnd(p, a, b):
 
 @njit(fastmath=True, cache=True)
 def psi_update_fused(psi, a, b, phi, beta, sigma, n):
-    """
-    In-place update of ψ *and* latent δ in a single pass.
-
-        δ_j  ~  Ga(a + b,   1 / (ψ_j + φ))
-        ψ_j' ~  GIG(a − ½,  2 δ_j,   n·β_j² / σ)
-
-    Returns
-    -------
-    delta_sum : float
-        ∑_j δ_j  — needed for the global-φ Gibbs step.
-
-    Notes
-    -----
-    * Keeps exactly the same Gibbs conditionals as PRS-CS.
-    * Eliminates the extra δ-array and the second loop over p SNPs.
-    """
     p = psi.size
     delta_sum = 0.0
     a_minus_half = a - 0.5
 
     for j in prange(p):
-        # ── draw δ_j ─────────────────────────────────────────
-        scale = 1.0 / (psi[j] + phi)            # 1 / (ψ + φ)
-        delta_j = np.random.gamma(a + b, scale)
+        # ── δ_j  ~  Ga(a+b, 1/(ψ+φ)) ────────────────────────────────
+        delta_j = np.random.gamma(a + b, 1.0 / (psi[j] + phi))
 
-        # ── draw ψ_j using the Devroye sampler ──────────────
-        psi_j = gigrnd(a_minus_half,
-                       2.0 * delta_j,
-                       n * (beta[j] * beta[j]) / sigma)
+        # ── prepare *safe* GIG parameters ───────────────────────────
+        a_gig = min(max(2.0 * delta_j,               GIG_MIN), GIG_MAX)
+        b_gig = min(max(n * beta[j] * beta[j] / sigma, GIG_MIN), GIG_MAX)
 
-        # soft upper-clip (matches original code)
-        if psi_j > 1.0:
+        # ── ψ_j  ~  GIG(a−½, a_gig, b_gig) ─────────────────────────
+        psi_j = gigrnd(a_minus_half, a_gig, b_gig)
+
+        # final defence: if any arithmetic above still produced a
+        # non-finite value, fall back to 1.0 (original PRS-CS clip)
+        if not math.isfinite(psi_j) or psi_j > 1.0:
             psi_j = 1.0
         psi[j] = psi_j
 
         delta_sum += delta_j
-
     return delta_sum
+
+@njit(cache=True, fastmath=True)
+def _chol_rank1_inplace(L, x, sign):
+    """
+    In-place rank-1 Cholesky update/downdate.
+
+    Parameters
+    ----------
+    L    : lower-triangular (m×m) float64 array, ON ENTRY a valid chol factor.
+           ON EXIT satisfies  L Lᵀ = A + sign·x xᵀ.
+    x    : length-m work vector (will be overwritten)
+    sign : +1.0 for update, -1.0 for downdate   (must keep A SPD!)
+
+    Returns 0 on success, 1 if a downdate would destroy SPD.
+    """
+    m = x.size
+    for k in range(m):
+        Lkk = L[k, k]
+        xk  = x[k]
+        if sign < 0.0 and abs(xk) >= Lkk:      # would make pivot ≤0
+            return 1
+        r = math.sqrt(Lkk*Lkk + sign*xk*xk)
+        c = r / Lkk
+        s = xk / Lkk
+        L[k, k] = r
+        if k + 1 < m:
+            for j in range(k + 1, m):
+                Ljk_old = L[j, k]
+                L[j, k] = (Ljk_old + sign*s*x[j]) / c
+                x[j]    = c*x[j] - s*Ljk_old
+    return 0
 
 @njit(cache=True, fastmath=True)
 def chol_diag_update_safe_nb(L, diag_curr, invpsi_new):
     """
-    Seeger rank-1 updates in float64 with an early-exit safety flag.
+    Incrementally apply     delta_value = invψ_new - invψ_old
+    to the cached Cholesky factor L.
 
     Returns
     -------
-    unsafe : int   (0 = all good, 1 = pivot became non-positive)
+    0 … update succeeded in-place
+    1 … step declared unsafe; caller must rebuild the factor
+
+    A step is unsafe if
+      • a DOWndate would shrink a pivot below   max(REL_TOL·old, L_PIVOT_MIN)
+      • an UPdate would increase a single diagonal by more than DELTA_VALUE_MAX
     """
-    n = diag_curr.size
-    for i in range(n):
-        delta = invpsi_new[i] - diag_curr[i]
-        if delta == 0.0:
+
+    m = diag_curr.size
+    x = np.empty(m, np.float64)
+
+    for i in range(m):
+        delta_value = invpsi_new[i] - diag_curr[i]
+        if delta_value == 0.0:
             continue
-        new_piv2 = L[i, i] * L[i, i] + delta
-        if new_piv2 <= 1e-12 or new_piv2 != new_piv2:   # <=0 or NaN
-            return 1                                   # unsafe
-        Liinew = new_piv2 ** 0.5
-        c = Liinew / L[i, i]
-        if i + 1 < n:
-            for j in range(i + 1, n):
-                L[j, i] /= c
-        L[i, i] = Liinew
+
+        # ─── dangerous downdate? ──────────────────────────────
+        if delta_value < 0.0:
+            new_diag = diag_curr[i] + delta_value
+            if (new_diag <= L_PIVOT_MIN or
+                new_diag <= REL_TOL * diag_curr[i]):
+                return 1
+
+        # ─── dangerous up-date?  ──────────────────────────────
+        if delta_value > DELTA_VALUE_MAX:
+            return 1
+
+        # rank-1 update/downdate
+        sign = 1.0
+        if delta_value < 0.0:
+            sign, delta_value = -1.0, -delta_value
+
+        x.fill(0.0)
+        x[i] = math.sqrt(delta_value)
+        if _chol_rank1_inplace(L, x, sign) != 0:      # SPD check
+            return 1
+
         diag_curr[i] = invpsi_new[i]
+
     return 0

@@ -32,46 +32,68 @@ PSI_MIN   = 1e-8
 PSI_MAX   = 1e8
 SIGMA_MIN = 1e-8
 
-# ---------- helper for one LD block ----------
+# ---------- helper for one LD block ----------------------------------
 def _sample_block_fused(state, psi_slice, sigma, n):
-    # ─ aliases ───────────────────────────────────────────────────────
-    L         = state["L"]                # float64 factor
-    diag_o    = state["diag_curr"]        # float64 1/ψ cache
-    beta_mrg  = state["beta_mrg"]
-    invpsi    = state["invpsi"]
-    zbuf      = state["zbuf"]
-    work      = state["work"]
+    """
+    Draw β for one LD block *and* return the quadratic form βᵀL Lᵀβ.
+
+    All arrays are float64 because the occasional 1e8 ↔ 1e-8 jumps in ψ
+    need head-room; speed comes from blocking and threaded BLAS, not dtype.
+    """
+    # ─ aliases --------------------------------------------------------
+    L         = state["L"]                 # (m×m) lower-tri Cholesky
+    diag_o    = state["diag_curr"]         # cached 1/ψ  (length-m)
+    beta_mrg  = state["beta_mrg"]          # β̂ (length-m)  *view*
+    invpsi    = state["invpsi"]            # work (length-m)
+    zbuf      = state["zbuf"]              # work (length-m)
     rng       = state["rng"]
 
-    # 1 ─ z draw
+    # 1 ─ z  ~  N(0, σ/n · I)
     rng.standard_normal(out=zbuf)
     zbuf *= (sigma / n) ** 0.5
 
-    # 2 ─ fast diagonal update (Numba)
-    np.reciprocal(psi_slice, out=invpsi)        # invpsi = 1/ψ   (float64 view)
+    # 2 ─ fast diagonal update of the factor
+    np.reciprocal(psi_slice, out=invpsi)   # invψ = 1 / ψ   (float64 view)
     unsafe = gigrnd.chol_diag_update_safe_nb(L, diag_o, invpsi)
-
-    if unsafe:
-        # one-off full rebuild in float64
-        L[:] = linalg.cholesky(
-            state["ld_blk"] + np.diag(invpsi),
-            lower=True
-        )
-        diag_o[:] = invpsi                      # sync cache
+    if (not unsafe) and np.isfinite(L).all():      # fast path OK
+        diag_o[:] = invpsi                        # keep cache coherent
+    else:
+        # fall back to a full rebuild (with jitter if needed)
+        try:
+            A = state["ld_blk"] + np.diag(invpsi)
+            L[:] = linalg.cholesky(A, lower=True, check_finite=True)
+            diag_o[:] = invpsi
+        except linalg.LinAlgError:
+            jitter = 1e-6
+            try:
+                A = state["ld_blk"] + np.diag(invpsi + jitter)
+                L[:] = linalg.cholesky(A, lower=True, check_finite=True)
+                diag_o[:] = invpsi + jitter
+                log.info(f"Cholesky rebuild succeeded with jitter {jitter}.")
+            except linalg.LinAlgError:
+                log.error("Rebuild still failed – zeroing this block.")
+                # raise ValueError("Rebuild still failed – zeroing this block.")
+                return np.zeros_like(beta_mrg), 0.0
 
     # 3 ─ y = Lᵀ⁻¹ β̂
-    work[:] = beta_mrg
-    linalg.blas.dtrsv(L, work, lower=1, trans=1, overwrite_x=1)
+    y = linalg.solve_triangular(
+        L, beta_mrg, lower=True, trans='T', check_finite=False
+    )
 
     # 4 ─ β = L⁻¹ (y + z)
-    work += zbuf
-    beta_b = linalg.blas.dtrsv(L, work, lower=1, trans=0, overwrite_x=1)
+    beta_b = linalg.solve_triangular(
+        L, y + zbuf, lower=True, trans='N', check_finite=False
+    )
 
-    # 5 ─ quad_b
-    tmp    = linalg.blas.dtrmv(L, beta_b, lower=1, trans=1)
-    quad_b = float(tmp @ tmp)
+    # 5 ─ quadratic form  βᵀL Lᵀβ   ( = || Lᵀβ ||² )
+    Lt_beta = L.T @ beta_b
+    quad_b  = float(Lt_beta @ Lt_beta)
+
+    if not np.isfinite(beta_b).all() or not np.isfinite(quad_b):
+        raise ValueError(f"Non-finite beta b ({beta_b}) or quad b ({quad_b})")
 
     return beta_b.copy(), quad_b
+
 
 STATE: List[Dict] | None = None          # one global per process
 def _init_worker(shared_state: List[Dict]):
@@ -111,6 +133,10 @@ def mcmc(a, b, phi, sst_dict, n, ld_blk, blk_size, n_iter, n_burnin, thin, chrom
 
     n_jobs = min(n_jobs, len(active))                  # Cap n_jobs at the number of non-empty blocks
 
+    # helper: always return a slice view, never a fancy-index copy
+    def _psi_view(r: range) -> np.ndarray:
+        return psi_1d[r.start : r.stop]          # shares memory with ψ
+
     # --- persistent Cholesky state for every LD block -----------------
     block_state: List[Dict | None] = []
     for k, r in enumerate(idx_ranges):
@@ -121,7 +147,33 @@ def mcmc(a, b, phi, sst_dict, n, ld_blk, blk_size, n_iter, n_burnin, thin, chrom
 
         # keep factor in float64 for numerical headroom
         ld_sub = ld_blk[k].astype(np.float64, copy=False)
-        L0 = linalg.cholesky(ld_sub + np.eye(m), lower=True).copy(order='F')
+
+        # Target diagonal based on initial psi=1.0
+        # invpsi values are expected to be positive. psi is clipped to PSI_MIN, PSI_MAX.
+        # So invpsi will be between 1/PSI_MAX and 1/PSI_MIN.
+        initial_invpsi_values = np.ones(m, dtype=np.float64) # psi is initialized to 1.0
+        try:
+            matrix_for_L0 = ld_sub + np.diag(initial_invpsi_values)
+            L0 = linalg.cholesky(matrix_for_L0, lower=True, check_finite=True).copy(order='F')
+            # diag_curr should store the diagonal that L0 is based on
+            current_diag_for_L0 = initial_invpsi_values.copy()
+        except linalg.LinAlgError:
+            log.warning(f"Initial Cholesky failed for block {k}. Attempting with jitter.")
+            jitter_val = 1e-6 # Small absolute jitter
+            try:
+                # Add jitter to the diagonal components that were summed with ld_sub
+                matrix_for_L0_jittered = ld_sub + np.diag(initial_invpsi_values + jitter_val)
+                L0 = linalg.cholesky(matrix_for_L0_jittered, lower=True, check_finite=True).copy(order='F')
+                current_diag_for_L0 = initial_invpsi_values + jitter_val # L0 is based on this
+                log.info(f"Initial Cholesky for block {k} succeeded with jitter {jitter_val}.")
+            except linalg.LinAlgError:
+                log.error(f"Initial Cholesky for block {k} failed even with jitter. "
+                        f"Using identity matrix for L0 as a last resort. Results for this block will be impacted.")
+                # Fallback to identity matrix for L0. This will make beta_b likely small or zero after solves.
+                L0 = np.eye(m, dtype=np.float64)
+                current_diag_for_L0 = np.ones(m, dtype=np.float64) # L0 is identity, so effectively diag(1) was added to 0 matrix
+
+        # L0 = linalg.cholesky(ld_sub + np.eye(m), lower=True).copy(order='F')
 
         block_state.append(
             dict(
@@ -131,7 +183,7 @@ def mcmc(a, b, phi, sst_dict, n, ld_blk, blk_size, n_iter, n_burnin, thin, chrom
                                 None if seed is None else seed + k
                              ),
                 L          = L0,
-                diag_curr  = np.ones(m, dtype=np.float64),
+                diag_curr  = current_diag_for_L0,
                 invpsi     = np.empty(m, dtype=np.float64),
                 zbuf       = np.empty(m, dtype=np.float64),
                 work       = np.empty(m, dtype=np.float64),
@@ -140,24 +192,30 @@ def mcmc(a, b, phi, sst_dict, n, ld_blk, blk_size, n_iter, n_burnin, thin, chrom
     
     # ----------- choose backend --------------------------------------------
     if backend == "threading":
-        blas_threads = 0 # use library default
+        blas_threads = 0
         workers = Parallel(n_jobs=n_jobs, backend="threading", prefer="threads")
         def _submit(k, r):
             return delayed(_sample_block_fused)(
-                block_state[k], psi_1d[r], sigma, n
+                block_state[k],                # per-block state
+                _psi_view(r),                  # ← view, not copy
+                sigma, n
             )
     elif backend == "loky":
         blas_threads = 1
         workers = Parallel(
-            n_jobs     = n_jobs,
-            backend    = "loky",
-            initializer= _init_worker,
-            initargs   = (block_state,),
+            n_jobs      = n_jobs,
+            backend     = "loky",
+            initializer = _init_worker,
+            initargs    = (block_state,),
         )
         def _submit(k, r):
-            return delayed(_loky_worker_body)(k, psi_1d[r], sigma, n)
+            return delayed(_loky_worker_body)(
+                k,
+                _psi_view(r),                  # ← view, not copy
+                sigma, n
+            )
     else:
-        raise ValueError(f"backend must be 'threading' or 'loky' (got {backend!r})")
+        raise ValueError("backend must be 'threading' or 'loky'")
 
     # one-off banner
     print(f"[DBG] backend={backend}  n_jobs={n_jobs}  active_blocks={len(active)}")
@@ -193,9 +251,11 @@ def mcmc(a, b, phi, sst_dict, n, ld_blk, blk_size, n_iter, n_burnin, thin, chrom
         # -------- β-step: threaded executor, fused update --------------
         t0 = time.perf_counter()
         if n_jobs == 1 or len(active) < 2:
-            # plain serial loop – fastest for 1 block
+            # serial fast-path
             results = [
-                _sample_block_fused(block_state[k], psi_1d[r], sigma, n)
+                _sample_block_fused(block_state[k],
+                                    _psi_view(r),          # ← view
+                                    sigma, n)
                 for k, r in active
             ]
         else:
@@ -206,20 +266,43 @@ def mcmc(a, b, phi, sst_dict, n, ld_blk, blk_size, n_iter, n_burnin, thin, chrom
 
         # unpack results ------------------------------------------------
         quad = 0.0
-        for ((k, r), (beta_b, quad_b)) in zip(active, results):
-            beta_1d[r] = beta_b
-            quad   += quad_b
+        for ((k_active, r_active), (beta_b_res, quad_b_res)) in zip(active, results): # Use distinct var names
+            if not np.isfinite(beta_b_res).all() or not np.isfinite(quad_b_res):
+                raise ValueError(f"Worker returned non-finite beta_b or quad_b for active block index {k_active} (range {r_active}). "
+                            f"Replacing with zeros for main accumulation. beta_b_res: {beta_b_res[:5]}, quad_b_res: {quad_b_res}")
+                # beta_1d[r_active] = 0.0 # Assign zeros to the corresponding slice in global beta
+                # quad_b_res from a block with bad beta_b_res is also suspect, so don't add it or add 0.
+                # The 0.0 from _sample_block_fused's own check should propagate here if it triggered.
+                # If it became non-finite during transfer or some other reason, quad_b_res could be NaN.
+                # if np.isfinite(quad_b_res):
+                #     quad += 0.0 # Effectively not adding if beta was bad.
+                # else quad remains unchanged, implicitly adding 0 for this bad block's contribution to quad.
+            else:
+                beta_1d[r_active] = beta_b_res
+                quad += quad_b_res
 
         s1 = float((beta * beta_mrg).sum())
+        if not np.isfinite(s1):
+            raise FloatingPointError("non-finite s1 – β or ψ corrupted")
         s2 = float((beta**2 / psi).sum())
+        if not np.isfinite(s2):
+            raise FloatingPointError("non-finite s2 – β or ψ corrupted")
+
         e1 = float(n/2.0*(1.0 - 2.0*s1 + quad))
         e2 = float(n/2.0*s2)
         err = max(e1, e2)
+
+        if not np.isfinite(err) or err <= 0.0:
+            raise FloatingPointError("non-finite or non-positive err in σ step")
 
         # σ-step (robust scale)
         scale = 1.0 / max(err, 1.0 / SIGMA_MIN)
         # force sigma to be a Python float (not a 0-d array)
         sigma = float(1.0 / np.random.gamma((n + p) / 2.0, scale))
+
+        # if not np.isfinite(beta).all():
+        #     # full reset of the offending block(s)
+        #     beta[np.isnan(beta) | np.isinf(beta)] = 0.0
 
         # ---------- ψ & δ  fused update  ----------
         t0 = time.perf_counter()
@@ -231,7 +314,9 @@ def mcmc(a, b, phi, sst_dict, n, ld_blk, blk_size, n_iter, n_burnin, thin, chrom
             sigma,
             n
         )
-        # np.clip(psi_1d, PSI_MIN, PSI_MAX, out=psi_1d)   # guard NaNs/∞
+        np.nan_to_num(psi_1d, copy=False, nan=1.0, posinf=PSI_MAX, neginf=PSI_MIN)
+        np.clip(psi_1d, PSI_MIN, PSI_MAX, out=psi_1d)        # keeps 1e-8 ≤ ψ ≤ 1e8
+
         timer['psi'] += time.perf_counter() - t0
         counts['psi'] += 1
         # ------------------------------
@@ -255,12 +340,12 @@ def mcmc(a, b, phi, sst_dict, n, ld_blk, blk_size, n_iter, n_burnin, thin, chrom
         # --- profiling banner ----
         timer['loop'] += time.perf_counter() - loop_start
         counts['loop'] += 1        # same as number of iterations
-        b  = timer['beta'] / max(counts['beta'], 1)
-        ps = timer['psi']  / max(counts['psi'],  1)
-        lo = timer['loop'] / max(counts['loop'], 1)
+        timer_b  = timer['beta'] / max(counts['beta'], 1)
+        timer_ps = timer['psi']  / max(counts['psi'],  1)
+        timer_lo = timer['loop'] / max(counts['loop'], 1)
         print(f"[PROFILE chr{chrom}] iter {itr:4d} | "
-            f"β {b:6.3f}s  ψ {ps:6.3f}s  other {lo-b-ps:6.3f}s "
-            f"(tot {lo:6.3f}s)")
+            f"β {timer_b:6.3f}s  ψ {timer_ps:6.3f}s  other {timer_lo-timer_b-timer_ps:6.3f}s "
+            f"(tot {timer_lo:6.3f}s). Currently, sigma=({sigma_est:.3e}), phi=({phi_est:.3e})")
 
     # convert standardized beta to per-allele beta
     if beta_std == 'FALSE':
