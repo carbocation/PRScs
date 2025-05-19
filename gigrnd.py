@@ -12,17 +12,17 @@ import math
 import numpy as np
 from numba import njit, prange
 
-@njit(cache=True, fastmath=True)
+@njit(cache=True)
 def psi(x, alpha, lam):
     f = -alpha*(math.cosh(x)-1.0)-lam*(math.exp(x)-x-1.0)
     return f
 
-@njit(cache=True, fastmath=True)
+@njit(cache=True)
 def dpsi(x, alpha, lam):
     f = -alpha*math.sinh(x)-lam*(math.exp(x)-1.0)
     return f
 
-@njit(cache=True, fastmath=True)
+@njit(cache=True)
 def g(x, sd, td, f1, f2):
     if (x >= -sd) and (x <= td):
         f = 1.0
@@ -33,7 +33,7 @@ def g(x, sd, td, f1, f2):
 
     return f
 
-@njit(cache=True, fastmath=True)
+@njit(cache=True)
 def gigrnd(p, a, b):
     # setup -- sample from the two-parameter version gig(lam,omega)
     # p = float(p); a = float(a); b = float(b)
@@ -125,7 +125,7 @@ def gigrnd(p, a, b):
     rnd = rnd/math.sqrt(a/b)
     return rnd
 
-@njit(parallel=True, fastmath=True, cache=True)
+@njit(fastmath=True, cache=True)
 def psi_update_fused(psi, a, b, phi, beta, sigma, n):
     """
     In-place update of ψ *and* latent δ in a single pass.
