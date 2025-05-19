@@ -12,6 +12,7 @@ from scipy import linalg
 from scipy.stats import geninvgauss
 from joblib import Parallel, delayed
 from joblib import parallel
+from threadpoolctl import threadpool_limits
 
 import logging
 import os
@@ -83,15 +84,16 @@ def mcmc(a, b, phi, sst_dict, n, ld_blk, blk_size, n_iter, n_burnin, thin, chrom
     for itr in range(1,n_iter+1):
         # --- parallel block sampler -------------------
         active = [(k, r) for k, r in enumerate(idx_ranges) if blk_size[k] > 0]
-        results = Parallel(n_jobs=n_jobs, backend="loky", prefer="processes", verbose=10)(
-                    delayed(_sample_block)(ld_blk[k],
-                                        psi[r, 0],
-                                        beta_mrg[r],
-                                        sigma, 
-                                        n,
-                                        block_seed=(None if seed is None else seed + itr * 1_000_003 + k))
-                    for k, r in active
-                )
+        with threadpool_limits(limits=1, user_api="blas"):   # lock BLAS to 1 thread
+            results = Parallel(n_jobs=n_jobs, backend="loky", prefer="processes", verbose=10)(
+                        delayed(_sample_block)(ld_blk[k],
+                                            psi[r, 0],
+                                            beta_mrg[r],
+                                            sigma, 
+                                            n,
+                                            block_seed=(None if seed is None else seed + itr * 1_000_003 + k))
+                        for k, r in active
+                    )
         
         if itr == 1:  # only on first iteration
             backend = parallel.get_active_backend()[0]
