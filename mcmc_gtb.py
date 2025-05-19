@@ -29,6 +29,11 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 # ---------- helper for one LD block ----------
+def _sample_block_wrapped(ld, psi_blk, beta_mrg_blk, sigma, n, block_seed=None):
+    """Same args as _sample_block, but forces MKL to 1 thread inside worker."""
+    with threadpool_limits(limits=1, user_api="blas"):
+        return _sample_block(ld, psi_blk, beta_mrg_blk, sigma, n, block_seed)
+
 def _sample_block(ld, psi_blk, beta_mrg_blk, sigma, n, block_seed=None):
     """Draw β for one LD block and return (β_block, quadratic form)."""
     rng = np.random.default_rng(block_seed)
@@ -84,8 +89,7 @@ def mcmc(a, b, phi, sst_dict, n, ld_blk, blk_size, n_iter, n_burnin, thin, chrom
     sigma_est = 0.0
     phi_est = 0.0
 
-    with threadpool_limits(limits=1, user_api="blas"):   # lock BLAS to 1 thread for creating the parpool
-        parpool = Parallel(n_jobs=n_jobs, backend="loky", prefer="processes")
+    parpool = Parallel(n_jobs=n_jobs, backend="loky", prefer="processes")
     
     # MCMC
     pp = 0
@@ -97,7 +101,7 @@ def mcmc(a, b, phi, sst_dict, n, ld_blk, blk_size, n_iter, n_burnin, thin, chrom
         t0 = time.perf_counter()
         active = [(k, r) for k, r in enumerate(idx_ranges) if blk_size[k] > 0]
         results = parpool(
-                    delayed(_sample_block)(ld_blk[k],
+                    delayed(_sample_block_wrapped)(ld_blk[k],
                                         psi[r, 0],
                                         beta_mrg[r],
                                         sigma, 
@@ -114,8 +118,9 @@ def mcmc(a, b, phi, sst_dict, n, ld_blk, blk_size, n_iter, n_burnin, thin, chrom
                 f"n_jobs={n_jobs}, non-empty blocks={len(active)}")
 
         if itr % 1 == 0:
-            log.info('chr %d  started iteration %d of %d (φ={%.3e})', chrom, itr, n_iter, phi_est)
-            print(f"[DEBUG] chr {chrom} completed iteration {itr} of {n_iter} with n_jobs={n_jobs} and non-empty blocks={len(active)}, φ={phi_est:.3e}")
+            status_of_phi = "burning in" if itr < n_burnin else f"φ={float(phi_est):.3e}"
+            log.info('chr %d  started iteration %d of %d (%s)', chrom, itr, n_iter, status_of_phi)
+            print(f"[DEBUG] chr {chrom} completed iteration {itr} of {n_iter} with n_jobs={n_jobs} and non-empty blocks={len(active)}, {status_of_phi}")
 
         quad = 0.0
         for (r, (beta_b, quad_b)) in zip([r for _, r in active], results):
