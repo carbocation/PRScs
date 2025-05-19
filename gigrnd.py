@@ -283,3 +283,41 @@ def chol_diag_update_safe_nb(
         diag_curr[i] = invpsi_new[i]
 
     return 0
+
+# ───────────────── ψ & δ  simple update (robust fallback) ────────────────
+@njit(cache=True)
+def psi_update_scalar(
+    psi:  np.ndarray,          # shape (p,)
+    a:    float,
+    b:    float,
+    phi:  float,
+    beta: np.ndarray,          # shape (p,)
+    sigma: float,
+    n_gwas: int,
+) -> float:
+    """Serial fallback: one Γ / one GIG draw per SNP, then clip ψ ≤ 1."""
+    p          = psi.size
+    delta_sum  = 0.0
+    a_minus_05 = a - 0.5
+
+    for j in range(p):
+        # 1) δ_j  ∼  Gamma(a+b, 1 / (ψᵢ + φ))
+        delta_j = np.random.gamma(a + b, 1.0 / (psi[j] + phi))
+
+        # 2) ψ_j  ∼ GIG(a−½, 2δ, nβ²/σ)
+        psi_j = gigrnd(
+            a_minus_05,
+            2.0 * delta_j,
+            n_gwas * beta[j] * beta[j] / sigma
+        )
+
+        # numeric guard and *tight* clip
+        if not np.isfinite(psi_j) or psi_j < PSI_MIN:
+            psi_j = PSI_MIN
+        elif psi_j > 1.0:
+            psi_j = 1.0
+
+        psi[j] = psi_j
+        delta_sum += delta_j
+
+    return delta_sum

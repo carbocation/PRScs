@@ -313,14 +313,17 @@ def mcmc(a, b, phi, sst_dict, n, ld_blk, blk_size, n_iter, n_burnin, thin, chrom
 
         # ---------- ψ & δ  fused update  ----------
         t0 = time.perf_counter()
-        delta_sum = gigrnd.psi_update_fused(
-            psi_1d,          # ψ is updated in-place
-            a, b,
-            phi,
-            beta_1d,
-            sigma,
-            n
+        delta_sum = gigrnd.psi_update_scalar(
+            psi_1d, a, b, phi, beta_1d, sigma, n
         )
+        # delta_sum = gigrnd.psi_update_fused(
+        #     psi_1d,          # ψ is updated in-place
+        #     a, b,
+        #     phi,
+        #     beta_1d,
+        #     sigma,
+        #     n
+        # )
         np.nan_to_num(psi_1d, copy=False, nan=1.0, posinf=PSI_MAX, neginf=PSI_MIN)
         np.clip(psi_1d, PSI_MIN, PSI_MAX, out=psi_1d)        # keeps 1e-8 ≤ ψ ≤ 1e8
 
