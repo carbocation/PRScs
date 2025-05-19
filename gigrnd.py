@@ -12,17 +12,17 @@ import math
 import numpy as np
 from numba import njit
 
-@njit(fastmath=True)
+@njit(cache=True, fastmath=True)
 def psi(x, alpha, lam):
     f = -alpha*(math.cosh(x)-1.0)-lam*(math.exp(x)-x-1.0)
     return f
 
-@njit(fastmath=True)
+@njit(cache=True, fastmath=True)
 def dpsi(x, alpha, lam):
     f = -alpha*math.sinh(x)-lam*(math.exp(x)-1.0)
     return f
 
-@njit(fastmath=True)
+@njit(cache=True, fastmath=True)
 def g(x, sd, td, f1, f2):
     if (x >= -sd) and (x <= td):
         f = 1.0
@@ -33,7 +33,7 @@ def g(x, sd, td, f1, f2):
 
     return f
 
-@njit(fastmath=True)
+@njit(cache=True, fastmath=True)
 def gigrnd(p, a, b):
     # setup -- sample from the two-parameter version gig(lam,omega)
     # p = float(p); a = float(a); b = float(b)
