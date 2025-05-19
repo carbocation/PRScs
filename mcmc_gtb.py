@@ -81,11 +81,6 @@ def mcmc(a, b, phi, sst_dict, n, ld_blk, blk_size, n_iter, n_burnin, thin, chrom
     # MCMC
     pp = 0
     for itr in range(1,n_iter+1):
-        if itr == 1:  # only on first iteration
-            backend = parallel.get_active_backend()[0]
-            print(f"[DBG] backend: {backend.__class__.__name__}, "
-                f"n_jobs={n_jobs}, non-empty blocks={len(active)}")
-            
         # --- parallel block sampler -------------------
         active = [(k, r) for k, r in enumerate(idx_ranges) if blk_size[k] > 0]
         results = Parallel(n_jobs=n_jobs, backend="loky", prefer="processes", verbose=10)(
@@ -97,6 +92,11 @@ def mcmc(a, b, phi, sst_dict, n, ld_blk, blk_size, n_iter, n_burnin, thin, chrom
                                         block_seed=(None if seed is None else seed + itr * 1_000_003 + k))
                     for k, r in active
                 )
+        
+        if itr == 1:  # only on first iteration
+            backend = parallel.get_active_backend()[0]
+            print(f"[DBG] backend: {backend.__class__.__name__}, "
+                f"n_jobs={n_jobs}, non-empty blocks={len(active)}")
 
         if itr % 10 == 0:
             log.info('chr %d  started iteration %d of %d', chrom, itr, n_iter)
