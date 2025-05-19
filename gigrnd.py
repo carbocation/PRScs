@@ -12,12 +12,20 @@ import math
 import numpy as np
 from numba import njit, prange
 
-GIG_MIN = 1e-300          # > 0   (avoids divide-by-zero)
-GIG_MAX = 1e+150          # << exp(709)   (avoids overflow)
-DELTA_VALUE_MAX = 1.0e4   # refuse extreme updates
+# ─────────────────────────────── constants ──────────────────────────────
+# These bounds are safe for IEEE‑754 double precision and do not affect the
+# practical posterior mass of the continuous‑shrinkage prior.
+PSI_MIN: float = 1.0e-8   # lower bound for every ψ‑draw (≫ 0)
+PSI_MAX: float = 1.0e8    # upper bound for every ψ‑draw (≪ exp(709))
 
-L_PIVOT_MIN = 1e-10      # absolute   (≈ 10 × ε for 64-bit)
-REL_TOL     = 1e-4       # relative   (reject delta_value that kills ≥ 99.99 % of a pivot)
+# Guard rails for the Cholesky rank‑1 update/downdate functions.
+GIG_MIN: float = 1.0e-300        # avoids divide‑by‑zero inside gigrnd
+GIG_MAX: float = 1.0e150         # avoids overflow  inside gigrnd
+DELTA_VALUE_MAX: float = 1.0e4   # refuse absurdly large updates
+L_PIVOT_MIN: float = 1.0e-10     # absolute pivot floor (≈ 10×ε for 64‑bit)
+REL_TOL: float = 1.0e-4          # reject downdates that crush ≥99.99 % of pivot
+# ────────────────────── helper functions for gigrnd ─────────────────────
+
 
 @njit(cache=True)
 def psi(x, alpha, lam):
@@ -133,103 +141,111 @@ def gigrnd(p, a, b):
     return rnd
 
 @njit(fastmath=True, cache=True)
-def psi_update_fused(psi, a, b, phi, beta, sigma, n):
-    p = psi.size
-    delta_sum = 0.0
-    a_minus_half = a - 0.5
-
-    for j in prange(p):
-        # ── δ_j  ~  Ga(a+b, 1/(ψ+φ)) ────────────────────────────────
-        delta_j = np.random.gamma(a + b, 1.0 / (psi[j] + phi))
-
-        # ── prepare *safe* GIG parameters ───────────────────────────
-        a_gig = min(max(2.0 * delta_j,               GIG_MIN), GIG_MAX)
-        b_gig = min(max(n * beta[j] * beta[j] / sigma, GIG_MIN), GIG_MAX)
-
-        # ── ψ_j  ~  GIG(a−½, a_gig, b_gig) ─────────────────────────
-        psi_j = gigrnd(a_minus_half, a_gig, b_gig)
-
-        # final defence: if any arithmetic above still produced a
-        # non-finite value, fall back to 1.0 (original PRS-CS clip)
-        if not math.isfinite(psi_j) or psi_j > 1.0:
-            psi_j = 1.0
-        psi[j] = psi_j
-
-        delta_sum += delta_j
-    return delta_sum
-
-@njit(cache=True, fastmath=True)
-def _chol_rank1_inplace(L, x, sign):
-    """
-    In-place rank-1 Cholesky update/downdate.
-    Returns 0 on success, 1 if the step would make A non-SPD.
-    """
-    m = x.size
-    for k in range(m):
-        Lkk = L[k, k]
-
-        # ─── refuse to touch near-zero pivots ──────────────────
-        if Lkk <= L_PIVOT_MIN:      # L_PIVOT_MIN
-            return 1                # caller will rebuild from scratch
-
-        xk = x[k]
-        if sign < 0.0 and abs(xk) >= Lkk:      # classic SPD test
-            return 1
-
-        r = math.sqrt(Lkk*Lkk + sign*xk*xk)
-        c = r / Lkk
-        s = xk / Lkk
-        L[k, k] = r
-        if k + 1 < m:
-            for j in range(k + 1, m):
-                Ljk_old = L[j, k]
-                L[j, k] = (Ljk_old + sign*s*x[j]) / c
-                x[j]    = c*x[j] - s*Ljk_old
-    return 0
-
-@njit(cache=True, fastmath=True)
-def chol_diag_update_safe_nb(L, diag_curr, invpsi_new):
-    """
-    Incrementally apply     delta_value = invψ_new - invψ_old
-    to the cached Cholesky factor L.
+def psi_update_fused(
+    psi: np.ndarray,  # (p,)
+    a_hyper: float,
+    b_hyper: float,
+    phi: float,
+    beta: np.ndarray,  # (p,)
+    sigma: float,
+    n_gwas: int,
+) -> float:
+    """Simultaneous one-pass update of δ *and* ψ vectors.
 
     Returns
     -------
-    0 … update succeeded in-place
-    1 … step declared unsafe; caller must rebuild the factor
-
-    A step is unsafe if
-      • a DOWndate would shrink a pivot below   max(REL_TOL·old, L_PIVOT_MIN)
-      • an UPdate would increase a single diagonal by more than DELTA_VALUE_MAX
+    float
+        Σ δ_j - the sum of fresh *δ* draws (needed elsewhere in PRS-CS).
     """
+    p: int = psi.size
+    delta_sum: float = 0.0
+    a_minus_half: float = a_hyper - 0.5
 
-    m = diag_curr.size
-    x = np.empty(m, np.float64)
+    for j in prange(p):
+        # ─── 1. draw δ_j ∼ Gamma(a+b, 1 / (ψ + φ)) ───────────────────
+        delta_j: float = np.random.gamma(a_hyper + b_hyper, 1.0 / (psi[j] + phi))
 
-    for i in range(m):
-        delta_value = invpsi_new[i] - diag_curr[i]
-        if delta_value == 0.0:
-            continue
+        # ─── 2. draw ψ_j ∼ GIG(a−½, 2δ, nβ²/σ) with numeric guards ────
+        a_gig: float = min(max(2.0 * delta_j, GIG_MIN), GIG_MAX)
+        b_gig: float = min(max(n_gwas * beta[j] * beta[j] / sigma, GIG_MIN), GIG_MAX)
 
-        # ─── dangerous downdate? ──────────────────────────────
-        if delta_value < 0.0:
-            new_diag = diag_curr[i] + delta_value
-            if (new_diag <= L_PIVOT_MIN or
-                new_diag <= REL_TOL * diag_curr[i]):
-                return 1
+        psi_j: float = gigrnd(a_minus_half, a_gig, b_gig)
 
-        # ─── dangerous up-date?  ──────────────────────────────
-        if delta_value > DELTA_VALUE_MAX:
+        # clip to representable interval (principled numeric guard)
+        if not math.isfinite(psi_j):
+            psi_j = 1.0     # ultra‑rare fallback
+        if psi_j < PSI_MIN:
+            psi_j = PSI_MIN
+        elif psi_j > PSI_MAX:
+            psi_j = PSI_MAX
+
+        psi[j] = psi_j
+        delta_sum += delta_j
+
+    return delta_sum
+
+@njit(cache=True, fastmath=True)
+def _chol_rank1_inplace(L: np.ndarray, x: np.ndarray, sign: float) -> int:  # noqa: N803
+    """In-place rank-1 Cholesky update/downdate.
+
+    Returns 0 on success, 1 if the proposed step would break SPD-ness.
+    """
+    m: int = x.size
+    for k in range(m):
+        Lkk: float = L[k, k]
+        if Lkk <= L_PIVOT_MIN:
+            return 1  # would create non‑SPD matrix
+
+        xk: float = x[k]
+        if sign < 0.0 and abs(xk) >= Lkk:
             return 1
 
-        # rank-1 update/downdate
-        sign = 1.0
-        if delta_value < 0.0:
-            sign, delta_value = -1.0, -delta_value
+        r_: float = math.sqrt(Lkk * Lkk + sign * xk * xk)
+        c_: float = r_ / Lkk
+        s_: float = xk / Lkk
+        L[k, k] = r_
+        if k + 1 < m:
+            for j in range(k + 1, m):
+                Ljk_old: float = L[j, k]
+                L[j, k] = (Ljk_old + sign * s_ * x[j]) / c_
+                x[j] = c_ * x[j] - s_ * Ljk_old
+    return 0
+
+@njit(cache=True, fastmath=True)
+def chol_diag_update_safe_nb(
+    L: np.ndarray,
+    diag_curr: np.ndarray,
+    invpsi_new: np.ndarray,
+) -> int:
+    """Incrementally apply  Δ = invψ_new − invψ_old to cached *L*.
+
+    Returns 0 if the update was applied in‑place, 1 if the caller must fall
+    back to a full Cholesky rebuild.
+    """
+    m: int = diag_curr.size
+    x: np.ndarray = np.empty(m, dtype=np.float64)
+
+    for i in range(m):
+        delta_val: float = invpsi_new[i] - diag_curr[i]
+        if delta_val == 0.0:
+            continue
+
+        # ─── safety checks on the diagonal move ────────────────────
+        if delta_val < 0.0:
+            new_diag: float = diag_curr[i] + delta_val
+            if new_diag <= L_PIVOT_MIN or new_diag <= REL_TOL * diag_curr[i]:
+                return 1
+        elif delta_val > DELTA_VALUE_MAX:
+            return 1
+
+        # ─── apply the rank‑1 update/downdate ──────────────────────
+        sign: float = 1.0
+        if delta_val < 0.0:
+            sign, delta_val = -1.0, -delta_val
 
         x.fill(0.0)
-        x[i] = math.sqrt(delta_value)
-        if _chol_rank1_inplace(L, x, sign) != 0:      # SPD check
+        x[i] = math.sqrt(delta_val)
+        if _chol_rank1_inplace(L, x, sign) != 0:
             return 1
 
         diag_curr[i] = invpsi_new[i]

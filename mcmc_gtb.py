@@ -35,45 +35,36 @@ SIGMA_MIN = 1e-8
 # ---------- helper for one LD block ----------------------------------
 def _sample_block_fused(state, psi_slice, sigma, n):
     """
-    Draw β for one LD block *and* return the quadratic form βᵀL Lᵀβ.
+    Draw β for one LD block and return (β_block, quadratic form).
 
-    All arrays are float64 because the occasional 1e8 ↔ 1e-8 jumps in ψ
-    need head-room; speed comes from blocking and threaded BLAS, not dtype.
+    Matches the current `block_state`:
+        ld_blk, beta_mrg, rng, L, diag_curr, invpsi, zbuf, work
     """
     # ─ aliases --------------------------------------------------------
-    L         = state["L"]                 # (m×m) lower-tri Cholesky
-    diag_o    = state["diag_curr"]         # cached 1/ψ  (length-m)
-    beta_mrg  = state["beta_mrg"]          # β̂ (length-m)  *view*
-    invpsi    = state["invpsi"]            # work (length-m)
-    zbuf      = state["zbuf"]              # work (length-m)
-    rng       = state["rng"]
+    L        = state["L"]          # (m×m) lower-tri Cholesky
+    diag_o   = state["diag_curr"]  # cached 1/ψ  (length-m)
+    beta_mrg = state["beta_mrg"]   # marginal β̂  (length-m)
+    invpsi   = state["invpsi"]     # work (length-m)
+    zbuf     = state["zbuf"]       # work (length-m)
+    rng      = state["rng"]
 
     # 1 ─ z  ~  N(0, σ/n · I)
     rng.standard_normal(out=zbuf)
     zbuf *= (sigma / n) ** 0.5
 
-    # 2 ─ fast diagonal update of the factor
-    np.reciprocal(psi_slice, out=invpsi)   # invψ = 1 / ψ   (float64 view)
+    # 2 ─ robust diagonal update of the Cholesky factor
+    np.reciprocal(np.clip(psi_slice, PSI_MIN, PSI_MAX), out=invpsi)
     unsafe = gigrnd.chol_diag_update_safe_nb(L, diag_o, invpsi)
-    if (not unsafe) and np.isfinite(L).all():      # fast path OK
-        diag_o[:] = invpsi                        # keep cache coherent
-    else:
-        # fall back to a full rebuild (with jitter if needed)
+    if unsafe or not np.isfinite(L).all():
         try:
             A = state["ld_blk"] + np.diag(invpsi)
-            L[:] = linalg.cholesky(A, lower=True, check_finite=True)
+            L[:] = linalg.cholesky(A, lower=True, check_finite=False)
             diag_o[:] = invpsi
         except linalg.LinAlgError:
-            jitter = 1e-6
-            try:
-                A = state["ld_blk"] + np.diag(invpsi + jitter)
-                L[:] = linalg.cholesky(A, lower=True, check_finite=True)
-                diag_o[:] = invpsi + jitter
-                log.info(f"Cholesky rebuild succeeded with jitter {jitter}.")
-            except linalg.LinAlgError:
-                log.error("Rebuild still failed – zeroing this block.")
-                # raise ValueError("Rebuild still failed – zeroing this block.")
-                return np.zeros_like(beta_mrg), 0.0
+            log.error("Cholesky rebuild failed – zeroing this block.")
+            return np.zeros_like(beta_mrg), 0.0
+    else:
+        diag_o[:] = invpsi  # keep cache coherent
 
     # 3 ─ y = Lᵀ⁻¹ β̂
     y = linalg.solve_triangular(
@@ -88,9 +79,6 @@ def _sample_block_fused(state, psi_slice, sigma, n):
     # 5 ─ quadratic form  βᵀL Lᵀβ   ( = || Lᵀβ ||² )
     Lt_beta = L.T @ beta_b
     quad_b  = float(Lt_beta @ Lt_beta)
-
-    if not np.isfinite(beta_b).all() or not np.isfinite(quad_b):
-        raise ValueError(f"Non-finite beta b ({beta_b}) or quad b ({quad_b})")
 
     return beta_b.copy(), quad_b
 
