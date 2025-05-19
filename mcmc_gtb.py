@@ -13,7 +13,8 @@ from scipy.stats import geninvgauss
 from joblib import Parallel, delayed
 from joblib import parallel
 from threadpoolctl import threadpool_limits
-
+import torch
+from torch import Tensor
 import time, collections
 
 import logging
@@ -29,155 +30,166 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 # ---------- helper for one LD block ----------
-def _sample_block_wrapped(ld, psi_blk, beta_mrg_blk, sigma, n, block_seed=None):
-    """Same args as _sample_block, but forces MKL to 1 thread inside worker."""
-    with threadpool_limits(limits=1, user_api="blas"):
-        return _sample_block(ld, psi_blk, beta_mrg_blk, sigma, n, block_seed)
+def _sample_block_torch(
+    ld_block      : Tensor,          # (m,m)  LD matrix for the block
+    psi_block     : Tensor,          # (m,1)  local shrinkage
+    beta_mrg_block: Tensor,          # (m,1)  marginal β̂
+    sigma         : float,
+    n_gwas        : int,
+    *, generator: torch.Generator
+) -> tuple[Tensor,float]:
+    """
+    Single-block β draw on *any* device (CPU or CUDA).
 
-def _sample_block(ld, psi_blk, beta_mrg_blk, sigma, n, block_seed=None):
-    """Draw β for one LD block and return (β_block, quadratic form)."""
-    rng = np.random.default_rng(block_seed)
-    dinvt = ld + np.diag(1.0 / psi_blk)
-    chol  = linalg.cholesky(dinvt)
-    z     = rng.standard_normal((len(psi_blk), 1)) * np.sqrt(sigma / n)
-    beta_b = linalg.solve_triangular(
-        chol,
-        linalg.solve_triangular(chol, beta_mrg_blk, trans='T') + z,
-        trans='N'
+    Returns (beta_block, quadratic_form) where
+
+        quadratic_form = βᵀ (LD + diag(1/ψ)) β
+    """
+    # 1. K⁻¹ = LD + diag(1/ψ)
+    dinvt = ld_block + torch.diag_embed(1.0 / psi_block.squeeze(-1))
+
+    # 2. Cholesky
+    chol_u = torch.linalg.cholesky(dinvt)         # upper-triangular (U)
+
+    # 3. RHS term  Uᵀ⁻¹ β̂           (solve with lower-triangular system)
+    rhs = torch.linalg.solve_triangular(
+        chol_u.mT,                                # Uᵀ is lower
+        beta_mrg_block,
+        upper=False
     )
-    quad_b = float(beta_b.T @ dinvt @ beta_b)
-    return beta_b, quad_b
 
-def mcmc(a, b, phi, sst_dict, n, ld_blk, blk_size, n_iter, n_burnin, thin, chrom, out_dir, beta_std, write_psi, write_pst, seed):
-    print('... MCMC ...')
+    # 4. Add normal noise 𝒩(0, σ/n I)
+    z = torch.randn_like(rhs, generator=generator) * (sigma / n_gwas) ** 0.5
 
-    n_jobs = int(os.environ.get("PRSCS_N_JOBS", "1"))     # default: 1
+    # 5. Final solve  β = U⁻¹ (rhs + z)
+    beta_block = torch.linalg.solve_triangular(
+        chol_u,
+        rhs + z,
+        upper=True
+    )
 
-    # seed
-    if seed is not None:
-        np.random.seed(seed)
+    quad = (beta_block.T @ dinvt @ beta_block).item()
+    return beta_block, quad
 
-    # derived stats
-    beta_mrg = np.array(sst_dict['BETA'], ndmin=2).T
-    maf = np.array(sst_dict['MAF'], ndmin=2).T
-    n_pst = int((n_iter-n_burnin)/thin)
-    p = len(sst_dict['SNP'])
-    n_blk = len(ld_blk)
+def mcmc(
+    a, b, phi_init,
+    sst_dict, n_gwas,
+    ld_blocks, block_sizes,
+    n_iter, n_burnin, thin,
+    chrom, out_dir,
+    beta_std='FALSE', write_psi='FALSE', write_pst='FALSE',
+    seed: int | None = None,
+    *, device: str | torch.device = 'cpu'
+):
+    """
+    PyTorch replacement for `mcmc()`.
 
-    # --- block index bookkeeping ---
-    starts = np.cumsum([0] + blk_size[:-1])       # 0-based starts
-    idx_ranges = [range(s, s + sz) for s, sz in zip(starts, blk_size)]
+    * All heavy linear-algebra happens on the chosen device.
+    * ψ-updates still call `gigrnd.gig_rvs_vec` on CPU in-place.
+    """
 
-    # initialization
-    beta = np.zeros((p,1))
-    psi = np.ones((p,1))
-    sigma = 1.0
+    # -----------------------------------------------------------------------
+    # 0.  PREP
+    # -----------------------------------------------------------------------
+    torch.set_default_dtype(torch.float64)
+    dev   = torch.device(device)
+    rng   = torch.Generator(device='cpu').manual_seed(seed or 0)   # CPU for ψ
+    rng_t = torch.Generator(device=dev).manual_seed(seed or 0)     # β-block RNG
 
-    beta_1d = beta[:, 0]    # view – updates automatically
-    psi_1d  = psi[:, 0]     # view – output buffer
-    
-    if phi == None:
-        phi = 1.0; phi_updt = True
+    beta_mrg = torch.as_tensor(sst_dict['BETA'],  device=dev).reshape(-1,1)
+    maf      = torch.as_tensor(sst_dict['MAF'],   device='cpu').reshape(-1,1)
+    p        = beta_mrg.numel()
+    n_pst    = (n_iter - n_burnin)//thin
+
+    # block indexing (same as before)
+    starts     = [0] + list(torch.tensor(block_sizes).cumsum(0)[:-1])
+    idx_ranges = [slice(s, s+sz) for s,sz in zip(starts, block_sizes)]
+
+    # -----------------------------------------------------------------------
+    # 1.  STATE  (all torch tensors unless noted)
+    # -----------------------------------------------------------------------
+    beta       = torch.zeros((p,1), device=dev)
+    psi        = torch.ones ((p,1), device='cpu')     # stay on CPU for GIG
+    sigma      = torch.tensor(1.0, device='cpu')
+
+    if phi_init is None:
+        phi, update_phi = torch.tensor(1.0), True
     else:
-        phi_updt = False
+        phi, update_phi = torch.tensor(float(phi_init)), False
 
-    if write_pst == 'TRUE':
-        beta_pst = np.zeros((p,n_pst))
+    # running means
+    beta_est  = torch.zeros_like(beta)
+    psi_est   = torch.zeros_like(psi)
+    sigma_est = torch.tensor(0.0)
+    phi_est   = torch.tensor(0.0)
 
-    beta_est = np.zeros((p,1))
-    psi_est = np.zeros((p,1))
-    sigma_est = 0.0
-    phi_est = 0.0
+    if write_pst.upper() == 'TRUE':
+        beta_pst = torch.empty((p, n_pst), device='cpu')
+        pst_idx  = 0
 
-    parpool = Parallel(n_jobs=n_jobs, backend="loky", prefer="processes")
-    
-    # MCMC
-    pp = 0
-    timer  = collections.Counter()
-    counts = collections.Counter()
-    for itr in range(1,n_iter+1):
-        loop_start = time.perf_counter()
-        # --- parallel block sampler -------------------
-        t0 = time.perf_counter()
-        active = [(k, r) for k, r in enumerate(idx_ranges) if blk_size[k] > 0]
-        results = parpool(
-                    delayed(_sample_block_wrapped)(ld_blk[k],
-                                        psi[r, 0],
-                                        beta_mrg[r],
-                                        sigma, 
-                                        n,
-                                        block_seed=(None if seed is None else seed + itr * 1_000_003 + k))
-                    for k, r in active
-                )
-        timer['beta'] += time.perf_counter() - t0
-        counts['beta'] += 1
-        
-        if itr == 1:  # only on first iteration
-            backend = parallel.get_active_backend()[0]
-            print(f"[DBG] backend: {backend.__class__.__name__}, "
-                f"n_jobs={n_jobs}, non-empty blocks={len(active)}")
+    # -----------------------------------------------------------------------
+    # 2.  MCMC LOOP
+    # -----------------------------------------------------------------------
+    for itr in range(1, n_iter+1):
+        # --- 2.1  β-block updates (device = dev) ---------------------------
+        quad_total = 0.0
+        for k, slc in enumerate(idx_ranges):
+            if block_sizes[k] == 0:
+                continue
 
-        if itr % 1 == 0:
-            status_of_phi = "burning in" if itr < n_burnin else f"φ={float(phi_est):.3e}"
-            log.info('chr %d  started iteration %d of %d (%s)', chrom, itr, n_iter, status_of_phi)
-            print(f"[DEBUG] chr {chrom} completed iteration {itr} of {n_iter} with n_jobs={n_jobs} and non-empty blocks={len(active)}, {status_of_phi}")
+            beta_b, quad_b = _sample_block_torch(
+                ld_blocks[k].to(dev),
+                psi[slc].to(dev),
+                beta_mrg[slc],
+                float(sigma), int(n_gwas),
+                generator=rng_t
+            )
+            beta[slc] = beta_b
+            quad_total += quad_b
+        # -------------------------------------------------------------------
 
-        quad = 0.0
-        for (r, (beta_b, quad_b)) in zip([r for _, r in active], results):
-            beta[r] = beta_b
-            quad   += quad_b
-        # ----------------------------------------------------
-
-        s1 = float((beta * beta_mrg).sum())
-        s2 = float((beta**2 / psi).sum())
-        e1 = float(n/2.0*(1.0 - 2.0*s1 + quad))
-        e2 = float(n/2.0*s2)
+        # --- 2.2  global σ update (CPU) ------------------------------------
+        #   e1 = n/2 (1 − 2β·β̂ + βᵀLDβ)
+        #   e2 = n/2 Σ β²/ψ
+        s1  = (beta.to('cpu') * beta_mrg.to('cpu')).sum().item()
+        s2  = ((beta.to('cpu')**2) / psi).sum().item()
+        e1  = 0.5*n_gwas*(1.0 - 2.0*s1 + quad_total)
+        e2  = 0.5*n_gwas*s2
         err = max(e1, e2)
 
-        # force sigma to be a Python float (not a 0-d array)
-        sigma = float(1.0/np.random.gamma((n+p)/2.0, 1.0/err))
+        sigma = 1.0 / np.random.gamma((n_gwas + p)*0.5, 1.0/err)   # numpy OK
 
-        delta = np.random.gamma(a+b, 1.0/(psi+phi))
-
-        # ---------- ψ-update ----------
-        t0 = time.perf_counter()
-        gigrnd.gig_rvs_vec(
-                psi_1d,          # out
-                a - 0.5,
-                delta[:, 0],
-                beta_1d,
-                sigma,
-                n
+        # --- 2.3  δ & ψ updates  (CPU) -------------------------------------
+        delta = np.random.gamma(a+b, 1.0/(psi.numpy() + phi))
+        gigrnd.gig_rvs_vec(                    # in-place on psi.numpy()
+            psi.numpy().ravel(),
+            a - 0.5,
+            delta.ravel(),
+            beta.to('cpu').numpy().ravel(),
+            sigma,
+            n_gwas
         )
-        psi_1d[psi_1d > 1.0] = 1.0
-        timer['psi'] += time.perf_counter() - t0
-        counts['psi'] += 1
-        # ------------------------------
+        psi.clamp_(max=1.0)
 
-        if phi_updt == True:
-            w = np.random.gamma(1.0, 1.0/(phi+1.0))
-            phi = np.random.gamma(p*b+0.5, 1.0/(sum(delta)+w))
+        # --- 2.4  φ update --------------------------------------------------
+        if update_phi:
+            w   = np.random.gamma(1.0, 1.0/(phi + 1.0))
+            phi = torch.tensor(np.random.gamma(p*b + 0.5, 1.0/(delta.sum() + w)))
 
-        # posterior
-        if (itr>n_burnin) and (itr % thin == 0):
-            beta_est = beta_est + beta/n_pst
-            psi_est = psi_est + psi/n_pst
-            sigma_est = sigma_est + sigma/n_pst
-            phi_est = phi_est + phi/n_pst
+        # --- 2.5  accumulate posterior samples -----------------------------
+        if itr > n_burnin and itr % thin == 0:
+            weight = 1.0 / n_pst
+            beta_est  += beta * weight
+            psi_est   += psi  * weight
+            sigma_est += sigma* weight
+            phi_est   += phi  * weight
+            if write_pst.upper() == 'TRUE':
+                beta_pst[:, pst_idx] = beta.to('cpu')
+                pst_idx += 1
 
-            if write_pst == 'TRUE':
-                beta_pst[:,[pp]] = beta
-                pp += 1
-        
-        timer['loop'] += time.perf_counter() - loop_start
-        counts['loop'] += 1        # same as number of iterations
-        
-        b  = timer['beta'] / max(counts['beta'], 1)
-        ps = timer['psi']  / max(counts['psi'],  1)
-        lo = timer['loop'] / max(counts['loop'], 1)
-        print(f"[PROFILE chr{chrom}] iter {itr:4d} | "
-            f"β {b:6.3f}s  ψ {ps:6.3f}s  other {lo-b-ps:6.3f}s "
-            f"(tot {lo:6.3f}s)")
+        # --- 2.6  logging ---------------------------------------------------
+        status = "burn-in" if itr < n_burnin else f"φ={phi_est.item():.3e}"
+        log.info("chr %d  iteration %d/%d  %s", chrom, itr, n_iter, status)
 
     # convert standardized beta to per-allele beta
     if beta_std == 'FALSE':
@@ -188,7 +200,7 @@ def mcmc(a, b, phi, sst_dict, n, ld_blk, blk_size, n_iter, n_burnin, thin, chrom
 
 
     # write posterior effect sizes
-    if phi_updt == True:
+    if update_phi == True:
         eff_file = out_dir + '_pst_eff_a%d_b%.1f_phiauto_chr%d.txt' % (a, b, chrom)
     else:
         eff_file = out_dir + '_pst_eff_a%d_b%.1f_phi%1.0e_chr%d.txt' % (a, b, phi, chrom)
@@ -203,7 +215,7 @@ def mcmc(a, b, phi, sst_dict, n, ld_blk, blk_size, n_iter, n_burnin, thin, chrom
 
     # write posterior estimates of psi
     if write_psi == 'TRUE':
-        if phi_updt == True:
+        if update_phi == True:
             psi_file = out_dir + '_pst_psi_a%d_b%.1f_phiauto_chr%d.txt' % (a, b, chrom)
         else:
             psi_file = out_dir + '_pst_psi_a%d_b%.1f_phi%1.0e_chr%d.txt' % (a, b, phi, chrom)
@@ -213,7 +225,7 @@ def mcmc(a, b, phi, sst_dict, n, ld_blk, blk_size, n_iter, n_burnin, thin, chrom
                 ff.write('%s\t%.6e\n' % (snp, psi))
 
     # print estimated phi
-    if phi_updt == True:
+    if update_phi == True:
         print('... Estimated global shrinkage parameter: %1.2e ...' % phi_est )
 
     print('... Done ...')
