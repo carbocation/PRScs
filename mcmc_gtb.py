@@ -141,7 +141,8 @@ def mcmc(a, b, phi, sst_dict, n, ld_blk, blk_size, n_iter, n_burnin, thin, chrom
         rng_iter = None if seed is None else np.random.default_rng(seed + itr * 2_000_033)
 
         if itr == 1:
-            print("[DBG]", geninvgauss.rvs.__doc__.splitlines()[0])
+            print("[DBG] full docstring for geninvgauss.rvs:\n")
+            print(geninvgauss.rvs.__doc__)
 
         def draw_chunk(start, stop, rs):
             """Draw ψ for slice [start:stop)."""
