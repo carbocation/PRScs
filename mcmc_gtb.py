@@ -12,6 +12,7 @@ from scipy import linalg
 from scipy.stats import geninvgauss
 from joblib import Parallel, delayed
 from threadpoolctl import threadpool_limits
+from concurrent.futures import ThreadPoolExecutor
 
 import logging
 import os
@@ -44,6 +45,7 @@ def mcmc(a, b, phi, sst_dict, n, ld_blk, blk_size, n_iter, n_burnin, thin, chrom
     print('... MCMC ...')
 
     n_jobs = int(os.environ.get("PRSCS_N_JOBS", "1"))     # default: 1
+    PSI_CHUNK = 10_000                                        # ~20 k SNPs per thread-call
 
     # seed
     if seed is not None:
@@ -116,21 +118,38 @@ def mcmc(a, b, phi, sst_dict, n, ld_blk, blk_size, n_iter, n_burnin, thin, chrom
 
         delta = np.random.gamma(a+b, 1.0/(psi+phi))
 
-        # --- vectorised ψ-update ---------------------------------
-        if seed is None:
-            rng_psi = None                       # let SciPy pick its own RNG
-        else:
-            # one unique seed per iteration (no dependence on n_jobs)
-            rng_psi = np.random.default_rng(seed + itr * 2_000_033)
-        psi[:, 0] = geninvgauss.rvs(
-                    a - 0.5,                      # shape  p = a – ½
-                    2.0 * delta.ravel(),          # scale  b = 2 δⱼ
-                    scale = sigma / (n * (beta.ravel() ** 2)),
-                    size  = p,                     # draw p values
-                    random_state = rng_psi
+        # ---------- threaded ψ-update ----------
+        # one deterministic RNG for this iteration (keeps reproducible across n_jobs)
+        rng_iter = None if seed is None else np.random.default_rng(seed + itr * 2_000_033)
+
+        def draw_chunk(start, stop, rs):
+            """Draw ψ for slice [start:stop)."""
+            return geninvgauss.rvs(
+                a - 0.5,
+                2.0 * delta[start:stop],
+                scale = sigma / (n * (beta[start:stop] ** 2)),
+                size  = stop - start,
+                random_state = rs
+            )
+
+        # build slice list
+        idxs = list(range(0, p, PSI_CHUNK)) + [p]       # e.g. 0, 20k, 40k, …, p
+        slices = [(idxs[i], idxs[i + 1]) for i in range(len(idxs) - 1)]
+
+        # run chunks in a thread pool (SciPy releases the GIL, so threads scale)
+        with ThreadPoolExecutor(max_workers=n_jobs) as pool:
+            futs = [
+                pool.submit(
+                    draw_chunk, s, e,
+                    None if rng_iter is None
+                        else np.random.default_rng(int(rng_iter.integers(1 << 63)))
                 )
+                for s, e in slices
+            ]
+            psi[:, 0] = np.concatenate([f.result() for f in futs])
+
         psi[psi > 1.0] = 1.0
-        # ---------------------------------------------------------
+        # ---------------------------------------------------------------
 
         if phi_updt == True:
             w = np.random.gamma(1.0, 1.0/(phi+1.0))
