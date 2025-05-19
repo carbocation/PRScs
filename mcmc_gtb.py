@@ -10,14 +10,10 @@ import gigrnd
 import numpy as np
 from scipy import linalg
 from joblib import Parallel, delayed
-import joblib
+from joblib import parallel
 from threadpoolctl import threadpool_limits
-import time, collections
 
-try:
-    from choldate import cholupdate, choldowndate # C-extension
-except ImportError:
-    cholupdate = choldowndate = None # triggers full Cholesky rebuild fallback
+import time, collections
 
 import logging
 import os
@@ -32,50 +28,24 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 # ---------- helper for one LD block ----------
-def _solve_with_cached_chol(chol, dinvt, beta_mrg_blk, sigma, n, rng):
-    z   = rng.standard_normal(beta_mrg_blk.shape) * np.sqrt(sigma / n)
-    tmp = linalg.solve_triangular(chol, beta_mrg_blk, lower=True,  check_finite=False)
-    beta_b = linalg.solve_triangular(chol.T, tmp + z, lower=False, check_finite=False)
+def _sample_block_wrapped(ld, psi_blk, beta_mrg_blk, sigma, n, block_seed=None):
+    """Same args as _sample_block, but forces MKL to 1 thread inside worker."""
+    with threadpool_limits(limits=1, user_api="blas"):
+        return _sample_block(ld, psi_blk, beta_mrg_blk, sigma, n, block_seed)
 
+def _sample_block(ld, psi_blk, beta_mrg_blk, sigma, n, block_seed=None):
+    """Draw β for one LD block and return (β_block, quadratic form)."""
+    rng = np.random.default_rng(block_seed)
+    dinvt = ld + np.diag(1.0 / psi_blk)
+    chol  = linalg.cholesky(dinvt)
+    z     = rng.standard_normal((len(psi_blk), 1)) * np.sqrt(sigma / n)
+    beta_b = linalg.solve_triangular(
+        chol,
+        linalg.solve_triangular(chol, beta_mrg_blk, trans='T') + z,
+        trans='N'
+    )
     quad_b = float(beta_b.T @ dinvt @ beta_b)
     return beta_b, quad_b
-
-# ---- helper ----------------------------------------------------
-def _diag_chol_update(chol: np.ndarray, dinvt: np.ndarray, invdiag: np.ndarray, delta: np.ndarray):
-    """Rank‑1 update/downdate of cached Cholesky factor after diagonal change.
-
-    Parameters
-    ----------
-    chol   : (m, m) float64 F‑order – lower‑triangular Cholesky factor of D⁻¹.
-    dinvt  : (m, m) float64 F‑order – cached D⁻¹ = R + diag(ψ⁻¹).
-    invdiag: (m,)   float64          – cached diag(D⁻¹).
-    delta  : (m,)   float64          – new_diag(D⁻¹) − old_diag(D⁻¹).
-    """
-    if not np.any(delta):
-        return  # nothing to do
-
-    # ---------- fallback: full rebuild ----------
-    if cholupdate is None:
-        dinvt[np.diag_indices_from(dinvt)] += delta
-        invdiag[:] += delta
-        chol[:] = linalg.cholesky(dinvt, lower=True, check_finite=False)
-        return
-
-    # ---------- fast rank‑1 updates (choldate) ----------
-    for sign_val in (+1, -1):
-        mask = delta > 0 if sign_val > 0 else delta < 0
-        if not np.any(mask):
-            continue
-        idx = np.nonzero(mask)[0]
-        root = np.sqrt(np.abs(delta[mask]))  # float64
-        for i, r in zip(idx, root):
-            e_i = np.zeros(chol.shape[0], dtype=np.float64, order="F")
-            e_i[i] = r
-            (cholupdate if sign_val > 0 else choldowndate)(chol, e_i)
-
-    # keep the caches consistent
-    dinvt[np.diag_indices_from(dinvt)] += delta
-    invdiag[:] += delta
 
 def mcmc(a, b, phi, sst_dict, n, ld_blk, blk_size, n_iter, n_burnin, thin, chrom, out_dir, beta_std, write_psi, write_pst, seed):
     print('... MCMC ...')
@@ -117,20 +87,12 @@ def mcmc(a, b, phi, sst_dict, n, ld_blk, blk_size, n_iter, n_burnin, thin, chrom
     if write_pst == 'TRUE':
         beta_pst = np.zeros((p,n_pst))
 
-    chol_blk, invdiag_blk, dinvt_blk = [], [], []
-    for k, r in enumerate(idx_ranges):
-        dinvt = np.array(ld_blk[k], dtype=np.float64, order="F", copy=True)
-        dinvt[np.diag_indices_from(dinvt)] += 1.0
-        chol_blk.append(linalg.cholesky(dinvt, lower=True, check_finite=False))
-        invdiag_blk.append(np.ones(len(r), dtype=np.float64))
-        dinvt_blk.append(dinvt)
-
-    parpool = Parallel(n_jobs=n_jobs, backend="threading", require="sharedmem")
-
     beta_est = np.zeros((p,1))
     psi_est = np.zeros((p,1))
     sigma_est = 0.0
     phi_est = 0.0
+
+    parpool = Parallel(n_jobs=n_jobs, backend="loky", prefer="processes")
     
     # MCMC
     pp = 0
@@ -140,43 +102,21 @@ def mcmc(a, b, phi, sst_dict, n, ld_blk, blk_size, n_iter, n_burnin, thin, chrom
         loop_start = time.perf_counter()
         # --- parallel block sampler -------------------
         t0 = time.perf_counter()
-        # 1) pick active blocks
         active = [(k, r) for k, r in enumerate(idx_ranges) if blk_size[k] > 0]
-
-        # 2) ------- rank-1 updates of each Cholesky -----------------
-        for k, r in active:
-            delta_vec = (1.0 / psi[r, 0]) - invdiag_blk[k]    # shape (m,)
-            _diag_chol_update(
-                chol_blk[k],
-                dinvt_blk[k],
-                invdiag_blk[k],
-                delta_vec,
-            )
-
-        # 3) ------- draw β in parallel using cached factors --------------
-        t0 = time.perf_counter()
         results = parpool(
-            delayed(_solve_with_cached_chol)(
-                chol_blk[k],
-                dinvt_blk[k],
-                beta_mrg[r],
-                sigma,
-                n,
-                np.random.default_rng(None if seed is None else (seed + itr*1_000_003 + k) & 0xFFFFFFFFFFFFFFFF)
-            )
-            for k, r in active
-        )
-        # copy results back
-        quad = 0.0
-        for (r, (beta_b, quad_b)) in zip([r for _, r in active], results):
-            beta[r] = beta_b.astype(np.float64)   # master β stays FP64
-            quad   += quad_b
-        
+                    delayed(_sample_block_wrapped)(ld_blk[k],
+                                        psi[r, 0],
+                                        beta_mrg[r],
+                                        sigma, 
+                                        n,
+                                        block_seed=(None if seed is None else seed + itr * 1_000_003 + k))
+                    for k, r in active
+                )
         timer['beta'] += time.perf_counter() - t0
         counts['beta'] += 1
         
         if itr == 1:  # only on first iteration
-            backend = joblib.parallel.get_active_backend()[0]
+            backend = parallel.get_active_backend()[0]
             print(f"[DBG] backend: {backend.__class__.__name__}, "
                 f"n_jobs={n_jobs}, non-empty blocks={len(active)}")
 
@@ -185,6 +125,10 @@ def mcmc(a, b, phi, sst_dict, n, ld_blk, blk_size, n_iter, n_burnin, thin, chrom
             log.info('chr %d  started iteration %d of %d (%s)', chrom, itr, n_iter, status_of_phi)
             print(f"[DEBUG] chr {chrom} completed iteration {itr} of {n_iter} with n_jobs={n_jobs} and non-empty blocks={len(active)}, {status_of_phi}")
 
+        quad = 0.0
+        for (r, (beta_b, quad_b)) in zip([r for _, r in active], results):
+            beta[r] = beta_b
+            quad   += quad_b
         # ----------------------------------------------------
 
         s1 = float((beta * beta_mrg).sum())
@@ -231,12 +175,12 @@ def mcmc(a, b, phi, sst_dict, n, ld_blk, blk_size, n_iter, n_burnin, thin, chrom
         timer['loop'] += time.perf_counter() - loop_start
         counts['loop'] += 1        # same as number of iterations
         
-        timer_b  = timer['beta'] / max(counts['beta'], 1)
-        timer_ps = timer['psi']  / max(counts['psi'],  1)
-        timer_lo = timer['loop'] / max(counts['loop'], 1)
+        b  = timer['beta'] / max(counts['beta'], 1)
+        ps = timer['psi']  / max(counts['psi'],  1)
+        lo = timer['loop'] / max(counts['loop'], 1)
         print(f"[PROFILE chr{chrom}] iter {itr:4d} | "
-            f"β {timer_b:6.3f}s  ψ {timer_ps:6.3f}s  other {timer_lo-timer_b-timer_ps:6.3f}s "
-            f"(tot {timer_lo:6.3f}s)")
+            f"β {b:6.3f}s  ψ {ps:6.3f}s  other {lo-b-ps:6.3f}s "
+            f"(tot {lo:6.3f}s)")
 
     # convert standardized beta to per-allele beta
     if beta_std == 'FALSE':
