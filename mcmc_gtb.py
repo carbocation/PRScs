@@ -80,24 +80,25 @@ def mcmc(a, b, phi, sst_dict, n, ld_blk, blk_size, n_iter, n_burnin, thin, chrom
     sigma_est = 0.0
     phi_est = 0.0
 
+    with threadpool_limits(limits=1, user_api="blas"):   # lock BLAS to 1 thread for creating the parpool
+        parpool = Parallel(n_jobs=n_jobs, backend="loky", prefer="processes")
+
     # MCMC
     pp = 0
     for itr in range(1,n_iter+1):
         # --- parallel block sampler -------------------
         active = [(k, r) for k, r in enumerate(idx_ranges) if blk_size[k] > 0]
+        results = parpool(
+                    delayed(_sample_block)(ld_blk[k],
+                                        psi[r, 0],
+                                        beta_mrg[r],
+                                        sigma, 
+                                        n,
+                                        block_seed=(None if seed is None else seed + itr * 1_000_003 + k))
+                    for k, r in active
+                )
 
-        with threadpool_limits(limits=1, user_api="blas"):   # lock BLAS to 1 thread
-            results = Parallel(n_jobs=n_jobs, backend="loky", prefer="processes")(
-                        delayed(_sample_block)(ld_blk[k],
-                                            psi[r, 0],
-                                            beta_mrg[r],
-                                            sigma, 
-                                            n,
-                                            block_seed=(None if seed is None else seed + itr * 1_000_003 + k))
-                        for k, r in active
-                    )
-
-        if itr % 10 == 0:
+        if itr % 1 == 0:
             log.info('chr %d  started iteration %d of %d', chrom, itr, n_iter)
             print(f"[DEBUG] chr {chrom} completed iteration {itr} of {n_iter} with n_jobs={n_jobs} and non-empty blocks={len(active)}")
 
