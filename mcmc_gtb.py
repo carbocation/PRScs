@@ -13,7 +13,6 @@ from scipy.stats import geninvgauss
 from joblib import Parallel, delayed
 from joblib import parallel
 from threadpoolctl import threadpool_limits
-from concurrent.futures import ThreadPoolExecutor
 
 import time, collections
 
@@ -48,7 +47,6 @@ def mcmc(a, b, phi, sst_dict, n, ld_blk, blk_size, n_iter, n_burnin, thin, chrom
     print('... MCMC ...')
 
     n_jobs = int(os.environ.get("PRSCS_N_JOBS", "1"))     # default: 1
-    PSI_CHUNK = 10_000                                        # ~20 k SNPs per thread-call
 
     # seed
     if seed is not None:
@@ -69,6 +67,9 @@ def mcmc(a, b, phi, sst_dict, n, ld_blk, blk_size, n_iter, n_burnin, thin, chrom
     beta = np.zeros((p,1))
     psi = np.ones((p,1))
     sigma = 1.0
+
+    beta_1d = beta[:, 0]    # view – updates automatically
+    psi_1d  = psi[:, 0]     # view – output buffer
     
     if phi == None:
         phi = 1.0; phi_updt = True
@@ -86,8 +87,6 @@ def mcmc(a, b, phi, sst_dict, n, ld_blk, blk_size, n_iter, n_burnin, thin, chrom
     with threadpool_limits(limits=1, user_api="blas"):   # lock BLAS to 1 thread for creating the parpool
         parpool = Parallel(n_jobs=n_jobs, backend="loky", prefer="processes")
     
-    thread_pool_psi = ThreadPoolExecutor(max_workers=n_jobs)
-
     # MCMC
     pp = 0
     timer  = collections.Counter()
@@ -135,40 +134,20 @@ def mcmc(a, b, phi, sst_dict, n, ld_blk, blk_size, n_iter, n_burnin, thin, chrom
 
         delta = np.random.gamma(a+b, 1.0/(psi+phi))
 
-        # ---------- threaded ψ-update ----------
+        # ---------- ψ-update ----------
         t0 = time.perf_counter()
-        # one deterministic RNG for this iteration (keeps reproducible across n_jobs)
-        rng_iter = None if seed is None else np.random.default_rng(seed + itr * 2_000_033)
-
-        if itr == 1:
-            print("[DBG] full docstring for geninvgauss.rvs:\n")
-            print(geninvgauss.rvs.__doc__)
-
-        def draw_chunk(start, stop, rs):
-            """Draw ψ for slice [start:stop)."""
-            return geninvgauss.rvs(
+        gigrnd.gig_rvs_vec(
+                psi_1d,          # out
                 a - 0.5,
-                2.0 * delta[start:stop, 0],
-                scale = sigma / (n * (delta[start:stop, 0] ** 2)),
-                size  = stop - start,
-                random_state = rs
-            )
-
-        # build slice list
-        idxs = list(range(0, p, PSI_CHUNK)) + [p]       # e.g. 0, 20k, 40k, …, p
-        slices = [(idxs[i], idxs[i + 1]) for i in range(len(idxs) - 1)]
-
-        # run chunks in a thread pool (SciPy releases the GIL, so threads scale)
-        futs = [ thread_pool_psi.submit(draw_chunk, s, e,
-                None if rng_iter is None
-                    else np.random.default_rng(int(rng_iter.integers(1<<63))))
-                for s, e in slices ]
-        psi[:, 0] = np.concatenate([f.result() for f in futs])
-
-        psi[psi > 1.0] = 1.0
+                delta[:, 0],
+                beta_1d,
+                sigma,
+                n
+        )
+        psi_1d[psi_1d > 1.0] = 1.0
         timer['psi'] += time.perf_counter() - t0
         counts['psi'] += 1
-        # ---------------------------------------------------------------
+        # ------------------------------
 
         if phi_updt == True:
             w = np.random.gamma(1.0, 1.0/(phi+1.0))
@@ -194,8 +173,6 @@ def mcmc(a, b, phi, sst_dict, n, ld_blk, blk_size, n_iter, n_burnin, thin, chrom
         print(f"[PROFILE chr{chrom}] iter {itr:4d} | "
             f"β {b:6.3f}s  ψ {ps:6.3f}s  other {lo-b-ps:6.3f}s "
             f"(tot {lo:6.3f}s)")
-
-    thread_pool_psi.shutdown(wait=True)
 
     # convert standardized beta to per-allele beta
     if beta_std == 'FALSE':

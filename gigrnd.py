@@ -10,7 +10,7 @@ Reference: L Devroye. Random variate generation for the generalized inverse Gaus
 
 import math
 import numpy as np
-from numba import njit
+from numba import njit, prange
 
 @njit(cache=True, fastmath=True)
 def psi(x, alpha, lam):
@@ -121,4 +121,17 @@ def gigrnd(p, a, b):
     rnd = rnd/math.sqrt(a/b)
     return rnd
 
+@njit(parallel=True, fastmath=True, cache=True)
+def gig_rvs_vec(out, a_minus_half, delta, beta, sigma, n):
+    """
+    Fill `out` (1-D float64 array) with GIG draws in parallel.
+    Each element uses the scalar `gigrnd` already defined above.
+    """
+    p = out.size
+    for j in prange(p):
+        out[j] = gigrnd(
+            a_minus_half,
+            2.0 * delta[j],
+            n * (beta[j] * beta[j]) / sigma
+        )
 
