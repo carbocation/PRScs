@@ -85,6 +85,8 @@ def mcmc(a, b, phi, sst_dict, n, ld_blk, blk_size, n_iter, n_burnin, thin, chrom
 
     with threadpool_limits(limits=1, user_api="blas"):   # lock BLAS to 1 thread for creating the parpool
         parpool = Parallel(n_jobs=n_jobs, backend="loky", prefer="processes")
+    
+    thread_pool_psi = ThreadPoolExecutor(max_workers=n_jobs)
 
     # MCMC
     pp = 0
@@ -153,16 +155,11 @@ def mcmc(a, b, phi, sst_dict, n, ld_blk, blk_size, n_iter, n_burnin, thin, chrom
         slices = [(idxs[i], idxs[i + 1]) for i in range(len(idxs) - 1)]
 
         # run chunks in a thread pool (SciPy releases the GIL, so threads scale)
-        with ThreadPoolExecutor(max_workers=n_jobs) as pool:
-            futs = [
-                pool.submit(
-                    draw_chunk, s, e,
-                    None if rng_iter is None
-                        else np.random.default_rng(int(rng_iter.integers(1 << 63)))
-                )
-                for s, e in slices
-            ]
-            psi[:, 0] = np.concatenate([f.result() for f in futs])
+        futs = [ thread_pool_psi.submit(draw_chunk, s, e,
+                None if rng_iter is None
+                    else np.random.default_rng(int(rng_iter.integers(1<<63))))
+                for s, e in slices ]
+        psi[:, 0] = np.concatenate([f.result() for f in futs])
 
         psi[psi > 1.0] = 1.0
         timer['psi'] += time.perf_counter() - t0
@@ -193,6 +190,8 @@ def mcmc(a, b, phi, sst_dict, n, ld_blk, blk_size, n_iter, n_burnin, thin, chrom
         print(f"[PROFILE chr{chrom}] iter {itr:4d} | "
             f"β {b:6.3f}s  ψ {ps:6.3f}s  other {lo-b-ps:6.3f}s "
             f"(tot {lo:6.3f}s)")
+
+    thread_pool_psi.shutdown(wait=True)
 
     # convert standardized beta to per-allele beta
     if beta_std == 'FALSE':
