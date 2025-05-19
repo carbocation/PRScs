@@ -135,3 +135,28 @@ def gig_rvs_vec(out, a_minus_half, delta, beta, sigma, n):
             n * (beta[j] * beta[j]) / sigma
         )
 
+@njit(fastmath=True, cache=True)
+def chol_diag_update_inplace(L, diag_old, diag_new):
+    """
+    In-place update of a lower-triangular Cholesky factor so that
+
+        L Lᵀ = A_old                (on entry)
+        L Lᵀ = A_old + diag(δ)      (on exit),  where δ = diag_new – diag_old
+
+    Both diag_old and diag_new are length-n 1-D arrays holding the diagonal
+    of A_old and A_new.  Works because each δᵢ eᵢeᵢᵀ is a rank-1 update.
+    """
+    n = L.shape[0]
+    for i in range(n):
+        delta = diag_new[i] - diag_old[i]
+        if delta == 0.0:
+            continue                 # nothing to do for this row/col
+
+        Lii_old = L[i, i]
+        Lii_new = (Lii_old**2 + delta) ** 0.5   # r  in the Seeger algorithm
+        c = Lii_new / Lii_old                  # cos
+        if i + 1 < n:
+            for j in range(i + 1, n):          # scale the column below i
+                L[j, i] /= c
+        L[i, i] = Lii_new
+        diag_old[i] = diag_new[i]              # keep book

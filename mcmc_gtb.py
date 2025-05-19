@@ -28,23 +28,34 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 # ---------- helper for one LD block ----------
-def _sample_block_wrapped(ld, psi_blk, beta_mrg_blk, sigma, n, block_seed=None):
-    """Same args as _sample_block, but forces MKL to 1 thread inside worker."""
+def _sample_block_wrapped(state, psi_blk, beta_mrg_blk, sigma, n, block_seed=None):
+    """Restrict MKL threads inside each joblib worker."""
     with threadpool_limits(limits=1, user_api="blas"):
-        return _sample_block(ld, psi_blk, beta_mrg_blk, sigma, n, block_seed)
+        return _sample_block(state, psi_blk, beta_mrg_blk, sigma, n, block_seed)
 
-def _sample_block(ld, psi_blk, beta_mrg_blk, sigma, n, block_seed=None):
-    """Draw β for one LD block and return (β_block, quadratic form)."""
+def _sample_block(state, psi_blk, beta_mrg_blk, sigma, n, block_seed=None):
+    """
+    Draw β for one LD block and return (β_block, quadratic form).
+    """
     rng = np.random.default_rng(block_seed)
-    dinvt = ld + np.diag(1.0 / psi_blk)
-    chol  = linalg.cholesky(dinvt)
-    z     = rng.standard_normal((len(psi_blk), 1)) * np.sqrt(sigma / n)
+
+    # --- fast diagonal update ---------------------------------------------
+    diag_new = (1.0 / psi_blk).astype(state['L'].dtype, copy=False)
+    gigrnd.chol_diag_update_inplace(state['L'], state['diag_curr'], diag_new)
+    # state['diag_curr'] was updated in-place by the kernel
+
+    # --- Gibbs draw --------------------------------------------------------
+    z = rng.standard_normal((len(psi_blk), 1)) * np.sqrt(sigma / n)
     beta_b = linalg.solve_triangular(
-        chol,
-        linalg.solve_triangular(chol, beta_mrg_blk, trans='T') + z,
+        state['L'],
+        linalg.solve_triangular(state['L'], beta_mrg_blk, trans='T') + z,
         trans='N'
     )
-    quad_b = float(beta_b.T @ dinvt @ beta_b)
+    # more expensive quadratic form:
+    # quad_b = float(beta_b.T @ (state['L'] @ state['L'].T) @ beta_b)
+    # cheaper quadratic form: || Lᵀ β ||²
+    tmp     = linalg.solve_triangular(state['L'], beta_b, trans='T', lower=True)
+    quad_b  = float((tmp * tmp).sum())
     return beta_b, quad_b
 
 def mcmc(a, b, phi, sst_dict, n, ld_blk, blk_size, n_iter, n_burnin, thin, chrom, out_dir, beta_std, write_psi, write_pst, seed):
@@ -70,6 +81,16 @@ def mcmc(a, b, phi, sst_dict, n, ld_blk, blk_size, n_iter, n_burnin, thin, chrom
     # --- block index bookkeeping ---
     starts = np.cumsum([0] + blk_size[:-1])       # 0-based starts
     idx_ranges = [range(s, s + sz) for s, sz in zip(starts, blk_size)]
+
+    # --- persistent Cholesky state for every LD block -----------------
+    block_state = []
+    for k, r in enumerate(idx_ranges):
+        if blk_size[k] == 0:                # empty block
+            block_state.append(None)
+            continue
+        L0 = linalg.cholesky(ld_blk[k] + np.eye(blk_size[k]), lower=True)
+        d0 = np.ones(blk_size[k], dtype=L0.dtype)           # current 1/ψ (starts at 1)
+        block_state.append({'L': L0, 'diag_curr': d0})
 
     # initialization
     beta = np.zeros((p,1))
@@ -104,7 +125,7 @@ def mcmc(a, b, phi, sst_dict, n, ld_blk, blk_size, n_iter, n_burnin, thin, chrom
         t0 = time.perf_counter()
         active = [(k, r) for k, r in enumerate(idx_ranges) if blk_size[k] > 0]
         results = parpool(
-                    delayed(_sample_block_wrapped)(ld_blk[k],
+                    delayed(_sample_block_wrapped)(block_state[k],
                                         psi[r, 0],
                                         beta_mrg[r],
                                         sigma, 
