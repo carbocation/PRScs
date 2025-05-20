@@ -54,8 +54,8 @@ def _sample_block(state, psi_blk, beta_mrg_blk, sigma, n, block_seed=None):
     # more expensive quadratic form:
     # quad_b = float(beta_b.T @ (state['L'] @ state['L'].T) @ beta_b)
     # cheaper quadratic form: || Lᵀ β ||²
-    tmp     = linalg.solve_triangular(state['L'], beta_b, trans='T', lower=True)
-    quad_b  = float((tmp * tmp).sum())
+    tmp = state['L'].T @ beta_b  # This computes Lᵀβ
+    quad_b = float((tmp * tmp).sum())
     return beta_b, quad_b
 
 def mcmc(a, b, phi, sst_dict, n, ld_blk, blk_size, n_iter, n_burnin, thin, chrom, out_dir, beta_std, write_psi, write_pst, seed):
