@@ -141,8 +141,7 @@ def mcmc(a, b, phi, sst_dict, n, ld_blk, blk_size, n_iter, n_burnin, thin, chrom
         counts['beta'] += 1
         
         if itr == 1:  # only on first iteration
-            backend = parallel.get_active_backend()[0]
-            log.info(f"[DBG] backend: {backend.__class__.__name__}, "
+            log.info(f"[DBG] backend: {parpool._backend.__class__.__name__}, "
                 f"n_jobs={n_jobs}, non-empty blocks={len(active)}")
 
         quad = 0.0
