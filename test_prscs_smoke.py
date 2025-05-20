@@ -11,7 +11,7 @@ from pathlib import Path
 # --- import the code under test -------------------------------------------
 from mcmc_gtb import mcmc
 
-def make_toy_inputs(p: int = 200, n_blocks: int = 4, rho: float = 0.9):
+def make_toy_inputs(p: int = 500, n_blocks: int = 10, rho: float = 0.9):
     """
     Create a toy dataset split into `n_blocks` contiguous LD blocks.
     Each block gets its own correlation matrix; between-block LD is zero

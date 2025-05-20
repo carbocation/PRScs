@@ -35,7 +35,7 @@ SIGMA_MIN = 1e-8
 # ---------- helper for one LD block ----------------------------------
 def _sample_block_fused(state, psi_slice, sigma, n):
     """
-    Draw β for one LD block *and* return (β_block, quadratic form).
+    Draw β for one LD block *and* return (β_block, quadratic form, did_fallback).
 
     Matches the current `block_state` layout:
         ld_blk, beta_mrg, rng, L, diag_curr, invpsi, zbuf, work
@@ -48,13 +48,20 @@ def _sample_block_fused(state, psi_slice, sigma, n):
     zbuf     = state["zbuf"]       # scratch (length-m)
     rng      = state["rng"]
 
+    # --- Initialize did_fallback ---
+    did_fallback = False # Assume fast path initially
+
     # 0 ─── robust ψ sanitisation (handles NaN/Inf before the reciprocal)
+    # This sanitization should ideally use the PSI_MIN/PSI_MAX consistent with your psi update logic
+    # If you switched to psi_update_scalar where psi_max is 1.0, this PSI_MAX here might be too large,
+    # but psi_slice comes from the global psi array which would have been clipped already.
+    # The key is consistency in what psi_slice is expected to be.
     np.nan_to_num(psi_slice,
                   copy=False,
-                  nan=1.0,
-                  posinf=PSI_MAX,
+                  nan=1.0, # Or a value consistent with your psi bounds, e.g., median of expected psi
+                  posinf=PSI_MAX, # Use the actual upper bound psi_slice could have
                   neginf=PSI_MIN)
-    np.clip(psi_slice, PSI_MIN, PSI_MAX, out=psi_slice)
+    np.clip(psi_slice, PSI_MIN, PSI_MAX, out=psi_slice) # Ensure psi_slice adheres to expected bounds
 
     # 1 ─── z  ←  N(0, σ/n · I)
     rng.standard_normal(out=zbuf)
@@ -63,44 +70,93 @@ def _sample_block_fused(state, psi_slice, sigma, n):
     # 2 ─── incremental diagonal update of the cached Cholesky factor
     np.reciprocal(psi_slice, out=invpsi)                 # invψₙₑw
     try:
+        # Assuming you have made gigrnd.chol_diag_update_safe_nb more robust
+        # (e.g., fastmath=False, internal c_==0 checks returning 1)
         unsafe = gigrnd.chol_diag_update_safe_nb(L, diag_o, invpsi)
     except ZeroDivisionError:
-        # A pivot collapsed all the way to zero inside the rank-1 update.
-        # Mark as *unsafe* so we rebuild from scratch below.
+        # This catch block is a good fallback if chol_diag_update_safe_nb itself isn't
+        # modified to always return 1 instead of raising ZeroDivisionError.
+        # Ideally, chol_diag_update_safe_nb is modified to not throw this.
+        log.warning("ZeroDivisionError caught during chol_diag_update_safe_nb. Forcing fallback.")
         unsafe = 1
 
     if unsafe or not np.isfinite(L).all():
+        # --- Fallback path taken ---
+        did_fallback = True
+        # log.debug(f"Block (ID/index if available) falling back to full Cholesky. unsafe_flag={unsafe}, L_finite={np.isfinite(L).all()}") # Optional debug log
         # Fallback: full (and robust) Cholesky rebuild
         try:
-            A = state["ld_blk"] + np.diag(invpsi)
+            A = state["ld_blk"] + np.diag(invpsi) # invpsi here is 1/psi_slice
             L[:] = linalg.cholesky(A, lower=True, check_finite=False)
             diag_o[:] = invpsi                     # keep cache coherent
         except linalg.LinAlgError:
-            log.error("Cholesky rebuild failed – zeroing this block.")
-            return np.zeros_like(beta_mrg), 0.0
+            # Log which block failed if possible (would need block index passed to state or similar)
+            log.error("Cholesky rebuild failed during fallback – zeroing this block.")
+            # Still return three values, including did_fallback status
+            return np.zeros_like(beta_mrg), 0.0, did_fallback # did_fallback is true here
     else:
+        # --- Fast path succeeded ---
+        # did_fallback remains False
         diag_o[:] = invpsi                         # cache stays coherent
 
     # 3 ─── y = Lᵀ⁻¹ β̂
-    y = linalg.solve_triangular(L,
-                                beta_mrg,
-                                lower=True,
-                                trans='T',
-                                check_finite=False)
+    try:
+        y = linalg.solve_triangular(L,
+                                    beta_mrg,
+                                    lower=True,
+                                    trans='T',
+                                    check_finite=False) # Set check_finite=True if L can have NaNs not caught before
+    except linalg.LinAlgError as e:
+        log.error(f"LinAlgError during first solve_triangular (L.T^-1 beta_mrg): {e}. Zeroing block. Fallback status: {did_fallback}")
+        return np.zeros_like(beta_mrg), 0.0, did_fallback
+    except ValueError as e: # Can happen if L contains NaNs/infs and check_finite=False
+        log.error(f"ValueError during first solve_triangular (L.T^-1 beta_mrg): {e}. Likely NaNs in L. Zeroing block. Fallback status: {did_fallback}")
+        return np.zeros_like(beta_mrg), 0.0, did_fallback
+
 
     # 4 ─── β = L⁻¹ (y + z)
-    beta_b = linalg.solve_triangular(L,
-                                     y + zbuf,
-                                     lower=True,
-                                     trans='N',
-                                     check_finite=False)
+    try:
+        beta_b = linalg.solve_triangular(L,
+                                         y + zbuf, # y or zbuf could be non-finite if previous steps had issues
+                                         lower=True,
+                                         trans='N',
+                                         check_finite=False) # Set check_finite=True if y+zbuf could be issues
+    except linalg.LinAlgError as e:
+        log.error(f"LinAlgError during second solve_triangular (L^-1 (y+z)): {e}. Zeroing block. Fallback status: {did_fallback}")
+        return np.zeros_like(beta_mrg), 0.0, did_fallback
+    except ValueError as e:
+        log.error(f"ValueError during second solve_triangular (L^-1 (y+z)): {e}. Likely NaNs. Zeroing block. Fallback status: {did_fallback}")
+        return np.zeros_like(beta_mrg), 0.0, did_fallback
+
+    # Check for NaNs in beta_b before quadratic form calculation
+    if not np.isfinite(beta_b).all():
+        log.warning(f"Non-finite values in beta_b after solves. Zeroing block. Fallback status: {did_fallback}")
+        # Log first few elements of L, y, zbuf, beta_b if this occurs often
+        # log.debug(f"L[:3,:3]=\n{L[:3,:3]}")
+        # log.debug(f"y[:5]={y[:5]}")
+        # log.debug(f"zbuf[:5]={zbuf[:5]}")
+        # log.debug(f"beta_b[:5]={beta_b[:5]}")
+        return np.zeros_like(beta_mrg), 0.0, did_fallback
+
 
     # 5 ─── quadratic form  βᵀ (L Lᵀ) β   ==  ||Lᵀ β||²
-    Lt_beta = L.T @ beta_b
-    quad_b  = float(Lt_beta @ Lt_beta)
+    # This can also fail if beta_b is non-finite
+    try:
+        Lt_beta = L.T @ beta_b
+        quad_b  = float(Lt_beta @ Lt_beta)
+        if not np.isfinite(quad_b):
+            log.warning(f"Non-finite quad_b ({quad_b}). Zeroing block. Fallback status: {did_fallback}")
+            # log.debug(f"L.T[:3,:3]=\n{L.T[:3,:3]}")
+            # log.debug(f"beta_b[:5]={beta_b[:5]}")
+            # log.debug(f"Lt_beta[:5]={Lt_beta[:5]}")
+            return np.zeros_like(beta_mrg), 0.0, did_fallback
 
-    return beta_b.copy(), quad_b
+    except Exception as e: # Catch any other error during quadratic form
+        log.error(f"Error during quadratic form calculation: {e}. Zeroing block. Fallback status: {did_fallback}")
+        return np.zeros_like(beta_mrg), 0.0, did_fallback
 
+
+    return beta_b.copy(), quad_b, did_fallback
 
 STATE: List[Dict] | None = None          # one global per process
 def _init_worker(shared_state: List[Dict]):
@@ -273,7 +329,11 @@ def mcmc(a, b, phi, sst_dict, n, ld_blk, blk_size, n_iter, n_burnin, thin, chrom
 
         # unpack results ------------------------------------------------
         quad = 0.0
-        for ((k_active, r_active), (beta_b_res, quad_b_res)) in zip(active, results): # Use distinct var names
+        fallbacks_this_iter = 0
+        for res_idx, ((k_active, r_active), res_tuple) in enumerate(zip(active, results)):
+            beta_b_res, quad_b_res, did_fallback_res = res_tuple # Unpack
+            if did_fallback_res:
+                fallbacks_this_iter += 1
             if not np.isfinite(beta_b_res).all() or not np.isfinite(quad_b_res):
                 raise ValueError(f"Worker returned non-finite beta_b or quad_b for active block index {k_active} (range {r_active}). "
                             f"Replacing with zeros for main accumulation. beta_b_res: {beta_b_res[:5]}, quad_b_res: {quad_b_res}")
@@ -287,6 +347,9 @@ def mcmc(a, b, phi, sst_dict, n, ld_blk, blk_size, n_iter, n_burnin, thin, chrom
             else:
                 beta_1d[r_active] = beta_b_res
                 quad += quad_b_res
+        
+        active_block_count = len(active) if active else 0 # Handle case of no active blocks
+        log.info(f"[ITER {itr}] Cholesky fallbacks: {fallbacks_this_iter} / {active_block_count} active blocks")
 
         s1 = float((beta * beta_mrg).sum())
         if not np.isfinite(s1):
@@ -307,6 +370,8 @@ def mcmc(a, b, phi, sst_dict, n, ld_blk, blk_size, n_iter, n_burnin, thin, chrom
         # force sigma to be a Python float (not a 0-d array)
         sigma = float(1.0 / np.random.gamma((n + p) / 2.0, scale))
 
+        log.info(f"[ITER {itr}] Sampled sigma: {sigma:.4e}")
+
         # if not np.isfinite(beta).all():
         #     # full reset of the offending block(s)
         #     beta[np.isnan(beta) | np.isinf(beta)] = 0.0
@@ -326,6 +391,23 @@ def mcmc(a, b, phi, sst_dict, n, ld_blk, blk_size, n_iter, n_burnin, thin, chrom
         # )
         np.nan_to_num(psi_1d, copy=False, nan=1.0, posinf=PSI_MAX, neginf=PSI_MIN)
         np.clip(psi_1d, PSI_MIN, PSI_MAX, out=psi_1d)        # keeps 1e-8 ≤ ψ ≤ 1e8
+
+        # PSI LOGGING
+        # ***** LOG PSI_1D STATISTICS RIGHT HERE *****
+        psi_min_val = np.min(psi_1d)
+        # If you used psi_update_scalar with a cap of 1.0, PSI_MAX here (1e8) might be misleading for the upper bound check.
+        # Adjust the max_bound_check_value accordingly.
+        # Assuming PSI_MAX is still 1e8 for this example, but if your effective cap is 1.0, use 1.0.
+        max_bound_check_value = 1.0 if False else PSI_MAX
+        psi_max_val = np.max(psi_1d)
+        psi_mean_val = np.mean(psi_1d)
+        # PSI_MIN is defined in your code (likely 1e-8)
+        num_at_min_bound = np.sum(psi_1d <= (PSI_MIN + 1e-12)) # Epsilon for float comparison
+        # Check against the *actual* upper bound being enforced
+        num_at_max_bound = np.sum(psi_1d >= (max_bound_check_value - 1e-9)) # Epsilon for float comparison
+        log.info(f"[ITER {itr}] psi_1d stats: min={psi_min_val:.4e}, max={psi_max_val:.4e}, mean={psi_mean_val:.4e}, "
+                f"count_at_min_bound={num_at_min_bound}, count_at_max_bound={num_at_max_bound} (upper_bound_checked={max_bound_check_value:.1e})")
+        # /PSI LOGGING
 
         timer['psi'] += time.perf_counter() - t0
         counts['psi'] += 1
