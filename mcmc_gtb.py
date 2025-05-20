@@ -30,7 +30,7 @@ log = logging.getLogger(__name__)
 # ---------- helper for one LD block ----------
 def _sample_block_wrapped(state, psi_blk, beta_mrg_blk, sigma, n, block_seed=None):
     """Restrict MKL threads inside each joblib worker."""
-    with threadpool_limits(limits=1, user_api="blas"):
+    with threadpool_limits(limits=2, user_api="blas"):
         return _sample_block(state, psi_blk, beta_mrg_blk, sigma, n, block_seed)
 
 def _sample_block(state, psi_blk, beta_mrg_blk, sigma, n, block_seed=None):
@@ -113,7 +113,10 @@ def mcmc(a, b, phi, sst_dict, n, ld_blk, blk_size, n_iter, n_burnin, thin, chrom
     sigma_est = 0.0
     phi_est = 0.0
 
-    parpool = Parallel(n_jobs=n_jobs, backend="loky", prefer="processes")
+    # Note that with our approach to state management (specifically "L"), the
+    # block state *will not evolve* (will not propagate back from the workers)
+    # if you use a truly parallel / 'loky' backend.
+    parpool = Parallel(n_jobs=n_jobs, backend="threading")
     
     # MCMC
     pp = 0

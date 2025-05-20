@@ -12,17 +12,17 @@ import math
 import numpy as np
 from numba import njit, prange
 
-@njit(cache=True, fastmath=True)
+@njit(cache=True, fastmath=False)
 def psi(x, alpha, lam):
     f = -alpha*(math.cosh(x)-1.0)-lam*(math.exp(x)-x-1.0)
     return f
 
-@njit(cache=True, fastmath=True)
+@njit(cache=True, fastmath=False)
 def dpsi(x, alpha, lam):
     f = -alpha*math.sinh(x)-lam*(math.exp(x)-1.0)
     return f
 
-@njit(cache=True, fastmath=True)
+@njit(cache=True, fastmath=False)
 def g(x, sd, td, f1, f2):
     if (x >= -sd) and (x <= td):
         f = 1.0
@@ -33,7 +33,7 @@ def g(x, sd, td, f1, f2):
 
     return f
 
-@njit(cache=True, fastmath=True)
+@njit(cache=True, fastmath=False)
 def gigrnd(p, a, b):
     # setup -- sample from the two-parameter version gig(lam,omega)
     # p = float(p); a = float(a); b = float(b)
@@ -121,7 +121,7 @@ def gigrnd(p, a, b):
     rnd = rnd/math.sqrt(a/b)
     return rnd
 
-@njit(parallel=True, fastmath=True, cache=True)
+@njit(parallel=True, fastmath=False, cache=True)
 def gig_rvs_vec(out, a_minus_half, delta, beta, sigma, n):
     """
     Fill `out` (1-D float64 array) with GIG draws in parallel.
@@ -135,16 +135,22 @@ def gig_rvs_vec(out, a_minus_half, delta, beta, sigma, n):
             n * (beta[j] * beta[j]) / sigma
         )
 
-@njit(fastmath=True, cache=True)
+@njit(fastmath=False, cache=True)
 def chol_diag_update_inplace(L, diag_old, diag_new):
     """
-    In-place update of a lower-triangular Cholesky factor so that
+    In-place update of a lower-triangular Cholesky factor L. 
+    
+    On entry, L is the Cholesky factor of some matrix M_old, where M_old =
+    A_underlying + np.diag(diag_old). On exit, L is updated to be the Cholesky
+    factor of M_new, where M_new = A_underlying + np.diag(diag_new).
 
-        L Lᵀ = A_old                (on entry)
-        L Lᵀ = A_old + diag(δ)      (on exit),  where δ = diag_new – diag_old
+    This is equivalent to saying that if L_entry L_entryᵀ = M_old, then L_exit
+    L_exitᵀ = M_old + np.diag(diag_new - diag_old).
 
-    Both diag_old and diag_new are length-n 1-D arrays holding the diagonal
-    of A_old and A_new.  Works because each δᵢ eᵢeᵢᵀ is a rank-1 update.
+    Both diag_old and diag_new are length-n 1-D arrays. `diag_old` stores the
+    diagonal values that were used to compute the input L. `diag_new` stores the
+    target diagonal values for the output L. The function works by applying
+    incremental updates for each diagonal element.
     """
     n = L.shape[0]
     for i in range(n):
