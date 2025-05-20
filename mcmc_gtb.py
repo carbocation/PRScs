@@ -62,6 +62,7 @@ def mcmc(a, b, phi, sst_dict, n, ld_blk, blk_size, n_iter, n_burnin, thin, chrom
     print('... MCMC ...')
 
     n_jobs = int(os.environ.get("PRSCS_N_JOBS", "1"))     # default: 1
+    UNCLAMP_PSI = os.getenv("PRSCS_UNCLAMP_PSI", "false").lower() in ("1", "true", "yes", "on")
 
     # seed
     if seed is not None:
@@ -141,13 +142,8 @@ def mcmc(a, b, phi, sst_dict, n, ld_blk, blk_size, n_iter, n_burnin, thin, chrom
         
         if itr == 1:  # only on first iteration
             backend = parallel.get_active_backend()[0]
-            print(f"[DBG] backend: {backend.__class__.__name__}, "
+            log.info(f"[DBG] backend: {backend.__class__.__name__}, "
                 f"n_jobs={n_jobs}, non-empty blocks={len(active)}")
-
-        if itr % 1 == 0:
-            status_of_phi = "burning in" if itr < n_burnin else f"φ={float(phi_est):.3e}"
-            log.info('chr %d  started iteration %d of %d (%s)', chrom, itr, n_iter, status_of_phi)
-            print(f"[DEBUG] chr {chrom} completed iteration {itr} of {n_iter} with n_jobs={n_jobs} and non-empty blocks={len(active)}, {status_of_phi}")
 
         quad = 0.0
         for (r, (beta_b, quad_b)) in zip([r for _, r in active], results):
@@ -176,7 +172,8 @@ def mcmc(a, b, phi, sst_dict, n, ld_blk, blk_size, n_iter, n_burnin, thin, chrom
                 sigma,
                 n
         )
-        psi_1d[psi_1d > 1.0] = 1.0
+        if not UNCLAMP_PSI:
+            psi_1d[psi_1d > 1.0] = 1.0
         timer['psi'] += time.perf_counter() - t0
         counts['psi'] += 1
         # ------------------------------
@@ -202,9 +199,16 @@ def mcmc(a, b, phi, sst_dict, n, ld_blk, blk_size, n_iter, n_burnin, thin, chrom
         b  = timer['beta'] / max(counts['beta'], 1)
         ps = timer['psi']  / max(counts['psi'],  1)
         lo = timer['loop'] / max(counts['loop'], 1)
-        print(f"[PROFILE chr{chrom}] iter {itr:4d} | "
-            f"β {b:6.3f}s  ψ {ps:6.3f}s  other {lo-b-ps:6.3f}s "
-            f"(tot {lo:6.3f}s)")
+        if itr < n_burnin:
+            status = "burning in"
+        else:
+            status = (
+                f"σ resid={sigma:.3e}, "
+                f"φ=(inst {phi:.3e} | post {phi_est:.3e}), "
+                f"snp ψ̄={float(psi.mean()):.3e}"
+            )
+        log.info(f"[PROFILE chr{chrom}] iter {itr:4d} | "
+            f"β {b:6.3f}s  ψ {ps:6.3f}s  other {lo-b-ps:6.3f}s (tot {lo:6.3f}s) | {status}")
 
     # convert standardized beta to per-allele beta
     if beta_std == 'FALSE':
