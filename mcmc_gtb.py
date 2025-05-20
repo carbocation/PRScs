@@ -92,7 +92,8 @@ def mcmc(a, b, phi, sst_dict, n, ld_blk, blk_size, n_iter, n_burnin, thin, chrom
     sigma_est = 0.0
     phi_est = 0.0
 
-    parpool = Parallel(n_jobs=n_jobs, backend="loky", prefer="processes")
+    # parpool = Parallel(n_jobs=n_jobs, backend="loky", prefer="processes")
+    parpool = Parallel(n_jobs=n_jobs, backend="threading")
     
     # MCMC
     pp = 0
