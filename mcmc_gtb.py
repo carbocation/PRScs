@@ -178,8 +178,8 @@ def mcmc(a, b, phi, sst_dict, n, ld_blk, blk_size, n_iter, n_burnin, thin, chrom
         # ------------------------------
 
         if phi_updt == True:
-            w = np.random.gamma(1.0, 1.0/(phi+1.0))
-            phi = np.random.gamma(p*b+0.5, 1.0/(sum(delta)+w))
+            w = float(np.random.gamma(1.0, 1.0/(phi+1.0)))
+            phi = float(np.random.gamma(p*b+0.5, 1.0/(sum(delta)+w)))
 
         # posterior
         if (itr>n_burnin) and (itr % thin == 0):
