@@ -163,14 +163,29 @@ def mcmc(a, b, phi, sst_dict, n, ld_blk, blk_size, n_iter, n_burnin, thin, chrom
 
         # ---------- ψ-update ----------
         t0 = time.perf_counter()
+        # Draw local shrinkage parameters ψₖ ~ GIG(…, …)  ← gigrnd picks them all at once
         gigrnd.gig_rvs_vec(
-                psi_1d,          # out
+                psi_1d,          # OUT: vector view into `psi`
                 a - 0.5,
-                delta[:, 0],
+                delta[:, 0],     # deltaₖ = Γ(a+b, scale = 1/(ψₖ + φ))
                 beta_1d,
                 sigma,
                 n
         )
+        # Keep the algebra finite without shifting the prior.
+        # - φ  (global shrinkage) : 0 → *infinite* shrinkage, large → weak
+        #   shrinkage. Floor at 1e-12.  Below that β-variance ≈ 0 anyway, but
+        #   1/(φψ) would overflow.
+        # - ψₖ (local  shrinkage) : 0 → extra shrinkage, 1 → no extra shrinkage.
+        #   Enforce φψₖ ≥ 1e-12 → 1/(φψₖ) ≤ 1e12, far from the 1e308 float
+        #   limit.
+        phi  = max(phi,  1e-12)
+        psi_1d[:] = np.maximum(psi_1d, 1e-12 / phi)
+
+        # NOTE – historical PRScs capped ψ at 1.0 to guarantee “some” local
+        # shrinkage. For modern sample sizes this cap is not numerically
+        # necessary and can suppress large-effect SNPs.  Set environmental
+        # variable PRSCS_UNCLAMP_PSI=true to disable.
         if not UNCLAMP_PSI:
             psi_1d[psi_1d > 1.0] = 1.0
         timer['psi'] += time.perf_counter() - t0
@@ -179,7 +194,7 @@ def mcmc(a, b, phi, sst_dict, n, ld_blk, blk_size, n_iter, n_burnin, thin, chrom
 
         if phi_updt == True:
             w = float(np.random.gamma(1.0, 1.0/(phi+1.0)))
-            phi = float(np.random.gamma(p*b+0.5, 1.0/(sum(delta)+w)))
+            phi = float(np.random.gamma(p*b+0.5, 1.0/(float(delta.sum())+w)))
 
         # posterior
         if (itr>n_burnin) and (itr % thin == 0):
@@ -229,7 +244,7 @@ def mcmc(a, b, phi, sst_dict, n, ld_blk, blk_size, n_iter, n_burnin, thin, chrom
                 ff.write(('%d\t%s\t%d\t%s\t%s' + '\t%.6e'*n_pst + '\n') % (chrom, snp, bp, a1, a2, *beta))
         else:
             for snp, bp, a1, a2, beta in zip(sst_dict['SNP'], sst_dict['BP'], sst_dict['A1'], sst_dict['A2'], beta_est):
-                ff.write('%d\t%s\t%d\t%s\t%s\t%.6e\n' % (chrom, snp, bp, a1, a2, beta))
+                ff.write('%d\t%s\t%d\t%s\t%s\t%.6e\n' % (chrom, snp, bp, a1, a2, beta.item()))
 
     # write posterior estimates of psi
     if write_psi == 'TRUE':
@@ -240,7 +255,7 @@ def mcmc(a, b, phi, sst_dict, n, ld_blk, blk_size, n_iter, n_burnin, thin, chrom
 
         with open(psi_file, 'w') as ff:
             for snp, psi in zip(sst_dict['SNP'], psi_est):
-                ff.write('%s\t%.6e\n' % (snp, psi))
+                ff.write('%s\t%.6e\n' % (snp, psi.item()))
 
     # print estimated phi
     if phi_updt == True:
