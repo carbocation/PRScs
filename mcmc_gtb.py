@@ -10,7 +10,6 @@ import gigrnd
 import numpy as np
 from scipy import linalg
 from joblib import Parallel, delayed
-from joblib import parallel
 from threadpoolctl import threadpool_limits
 
 import time, collections
@@ -18,6 +17,11 @@ import time, collections
 import logging
 import os
 import sys
+
+N_JOBS = int(os.environ.get("PRSCS_N_JOBS", "1"))     # default: 1
+N_BLAS_THREADS = int(os.environ.get("PRSCS_N_BLAS_THREADS", "1"))     # default: 1
+UNCLAMP_PSI = os.getenv("PRSCS_UNCLAMP_PSI", "false").lower() in ("1", "true", "yes", "on")
+USE_LOKY = os.getenv("PRSCS_USE_LOKY", "false").lower() in ("1", "true", "yes", "on")
 
 logging.basicConfig(
     level=logging.INFO,                  # change to DEBUG for finer detail
@@ -30,7 +34,7 @@ log = logging.getLogger(__name__)
 # ---------- helper for one LD block ----------
 def _sample_block_wrapped(ld, psi_blk, beta_mrg_blk, sigma, n, block_seed=None):
     """Same args as _sample_block, but forces MKL to 1 thread inside worker."""
-    with threadpool_limits(limits=1, user_api="blas"):
+    with threadpool_limits(limits=N_BLAS_THREADS, user_api="blas"):
         return _sample_block(ld, psi_blk, beta_mrg_blk, sigma, n, block_seed)
 
 def _sample_block(ld, psi_blk, beta_mrg_blk, sigma, n, block_seed=None):
@@ -49,8 +53,6 @@ def _sample_block(ld, psi_blk, beta_mrg_blk, sigma, n, block_seed=None):
 
 def mcmc(a, b, phi, sst_dict, n, ld_blk, blk_size, n_iter, n_burnin, thin, chrom, out_dir, beta_std, write_psi, write_pst, seed):
     print('... MCMC ...')
-
-    n_jobs = int(os.environ.get("PRSCS_N_JOBS", "1"))     # default: 1
 
     # seed
     if seed is not None:
@@ -92,8 +94,10 @@ def mcmc(a, b, phi, sst_dict, n, ld_blk, blk_size, n_iter, n_burnin, thin, chrom
     sigma_est = 0.0
     phi_est = 0.0
 
-    parpool = Parallel(n_jobs=n_jobs, backend="loky", prefer="processes")
-    # parpool = Parallel(n_jobs=n_jobs, backend="threading")
+    if USE_LOKY:
+        parpool = Parallel(n_jobs=N_JOBS, backend="loky", prefer="processes")
+    else:
+        parpool = Parallel(n_jobs=N_JOBS, backend="threading")
     
     # MCMC
     pp = 0
@@ -117,14 +121,9 @@ def mcmc(a, b, phi, sst_dict, n, ld_blk, blk_size, n_iter, n_burnin, thin, chrom
         counts['beta'] += 1
         
         if itr == 1:  # only on first iteration
-            backend = parallel.get_active_backend()[0]
+            backend = parpool._backend
             print(f"[DBG] backend: {backend.__class__.__name__}, "
-                f"n_jobs={n_jobs}, non-empty blocks={len(active)}")
-
-        if itr % 1 == 0:
-            status_of_phi = "burning in" if itr < n_burnin else f"φ={float(phi_est):.3e}"
-            log.info('chr %d  started iteration %d of %d (%s)', chrom, itr, n_iter, status_of_phi)
-            print(f"[DEBUG] chr {chrom} completed iteration {itr} of {n_iter} with n_jobs={n_jobs} and non-empty blocks={len(active)}, {status_of_phi}")
+                f"n_jobs={N_JOBS}, non-empty blocks={len(active)}")
 
         quad = 0.0
         for (r, (beta_b, quad_b)) in zip([r for _, r in active], results):
@@ -153,7 +152,8 @@ def mcmc(a, b, phi, sst_dict, n, ld_blk, blk_size, n_iter, n_burnin, thin, chrom
                 sigma,
                 n
         )
-        psi_1d[psi_1d > 1.0] = 1.0
+        if not UNCLAMP_PSI:
+            psi_1d[psi_1d > 1.0] = 1.0
         timer['psi'] += time.perf_counter() - t0
         counts['psi'] += 1
         # ------------------------------
@@ -179,9 +179,21 @@ def mcmc(a, b, phi, sst_dict, n, ld_blk, blk_size, n_iter, n_burnin, thin, chrom
         b  = timer['beta'] / max(counts['beta'], 1)
         ps = timer['psi']  / max(counts['psi'],  1)
         lo = timer['loop'] / max(counts['loop'], 1)
-        print(f"[PROFILE chr{chrom}] iter {itr:4d} | "
-            f"β {b:6.3f}s  ψ {ps:6.3f}s  other {lo-b-ps:6.3f}s "
-            f"(tot {lo:6.3f}s)")
+        if itr < n_burnin:
+            status = (
+                f"burning in"
+                f"σ resid={sigma:.3e}, "
+                f"φ=(inst {float(phi):.3e} | post {float(phi_est):.3e}), "
+                f"snp ψ̄={float(psi.mean()):.3e}"
+            )
+        else:
+            status = (
+                f"σ resid={sigma:.3e}, "
+                f"φ=(inst {float(phi):.3e} | post {float(phi_est):.3e}), "
+                f"snp ψ̄={float(psi.mean()):.3e}"
+            )
+        log.info(f"[PROFILE chr{chrom}] iter {itr:4d} | "
+            f"β {b:6.3f}s  ψ {ps:6.3f}s  other {lo-b-ps:6.3f}s (tot {lo:6.3f}s) | {status}")
 
     # convert standardized beta to per-allele beta
     if beta_std == 'FALSE':
