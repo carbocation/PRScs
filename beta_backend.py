@@ -675,6 +675,233 @@ class CudaDirectBetaBackend(CudaBetaBackend):
         )
 
 
+class CudaHybridBetaBackend(CudaDirectBetaBackend):
+    """Exact FP64 backend selecting dense routines by bucket occupancy."""
+
+    name = "cuda-hybrid"
+    _minimum_batched_count = 8
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        if self._host_dtype == np.dtype(np.float32):
+            self._potrf_single = self._cusolver.spotrf
+            self._potrf_buffer_size = self._cusolver.spotrf_bufferSize
+            self._trsm_single = self._cublas.strsm
+        else:
+            self._potrf_single = self._cusolver.dpotrf
+            self._potrf_buffer_size = self._cusolver.dpotrf_bufferSize
+            self._trsm_single = self._cublas.dtrsm
+
+        cp = self._cp
+        maximum_lwork = 0
+        self._unbatched_groups = 0
+        self._unbatched_matrices = 0
+        self._batched_groups = 0
+        self._batched_matrices = 0
+        with self._device:
+            for group in self._groups:
+                count = int(group["precision"].shape[0])
+                use_unbatched = count < self._minimum_batched_count
+                group["use_unbatched"] = use_unbatched
+                if use_unbatched:
+                    size = int(group["precision"].shape[-1])
+                    lwork = int(self._potrf_buffer_size(
+                        self._cusolver_handle,
+                        self._cublas.CUBLAS_FILL_MODE_UPPER,
+                        size,
+                        group["precision"][0].data.ptr,
+                        size,
+                    ))
+                    group["single_lwork"] = lwork
+                    maximum_lwork = max(maximum_lwork, lwork)
+                    self._unbatched_groups += 1
+                    self._unbatched_matrices += count
+                else:
+                    self._batched_groups += 1
+                    self._batched_matrices += count
+
+            self._single_workspace = cp.empty(
+                maximum_lwork, dtype=self._cuda_dtype
+            )
+            self._resident_bytes += int(self._single_workspace.nbytes)
+            if self._direct_profile_enabled:
+                self._hybrid_profile_events = [
+                    cp.cuda.Event() for _ in range(6)
+                ]
+
+    def _factor_group(self, group):
+        size = int(group["precision"].shape[-1])
+        count = int(group["precision"].shape[0])
+        if not group["use_unbatched"]:
+            self._potrf_batched(
+                self._cusolver_handle,
+                self._cublas.CUBLAS_FILL_MODE_UPPER,
+                size,
+                group["precision_ptrs"].data.ptr,
+                size,
+                group["potrf_info"].data.ptr,
+                count,
+            )
+            return
+
+        for matrix_index in range(count):
+            self._potrf_single(
+                self._cusolver_handle,
+                self._cublas.CUBLAS_FILL_MODE_UPPER,
+                size,
+                group["precision"][matrix_index].data.ptr,
+                size,
+                self._single_workspace.data.ptr,
+                group["single_lwork"],
+                group["potrf_info"][matrix_index:].data.ptr,
+            )
+
+    def _solve_group(self, group, trans):
+        if not group["use_unbatched"]:
+            self._triangular_solve(group, trans)
+            return
+
+        size = int(group["precision"].shape[-1])
+        count = int(group["precision"].shape[0])
+        for matrix_index in range(count):
+            self._trsm_single(
+                self._cublas_handle,
+                self._cublas.CUBLAS_SIDE_LEFT,
+                self._cublas.CUBLAS_FILL_MODE_UPPER,
+                trans,
+                self._cublas.CUBLAS_DIAG_NON_UNIT,
+                size,
+                1,
+                self._one.ctypes.data,
+                group["precision"][matrix_index].data.ptr,
+                size,
+                group["rhs"][matrix_index].data.ptr,
+                size,
+            )
+
+    def sample(self, psi, sigma):
+        """Draw beta with regular dense routines for sparse size buckets."""
+        cp = self._cp
+        profile_started = (
+            time.perf_counter() if self._direct_profile_enabled else None
+        )
+        psi = np.asarray(psi, dtype=self._host_dtype).reshape(-1)
+        if psi.size != self._p:
+            raise ValueError("psi and beta_mrg must have the same length")
+
+        with self._device:
+            if self._direct_profile_enabled:
+                self._direct_profile_preamble[0].record()
+            self._psi_device.set(psi)
+            quad = cp.zeros((), dtype=self._cuda_dtype)
+            sd = float(np.sqrt(float(sigma) / self._n_gwas))
+            noise = self._rng.standard_normal(
+                self._p, dtype=self._cuda_dtype
+            )
+            if self._direct_profile_enabled:
+                self._direct_profile_preamble[1].record()
+                self._hybrid_profile_events[0].record()
+
+            for group in self._groups:
+                precision = group["precision"]
+                cp.copyto(precision, group["ld"])
+                safe_indices = group["indices"]
+                inv_psi = cp.where(
+                    group["valid"],
+                    1.0 / self._psi_device[safe_indices],
+                    0.0,
+                )
+                diag = group["diag"]
+                precision[:, diag, diag] += inv_psi
+            if self._direct_profile_enabled:
+                self._hybrid_profile_events[1].record()
+
+            for group in self._groups:
+                self._factor_group(group)
+            if self._direct_profile_enabled:
+                self._hybrid_profile_events[2].record()
+
+            if not self._potrf_checked:
+                for group_index, group in enumerate(self._groups):
+                    info = cp.asnumpy(group["potrf_info"])
+                    failures = np.flatnonzero(info)
+                    if failures.size:
+                        first = int(failures[0])
+                        raise RuntimeError(
+                            "hybrid CUDA Cholesky failed in size bucket "
+                            "%d, matrix %d with info=%d" %
+                            (group_index, first, int(info[first]))
+                        )
+
+            for group in self._groups:
+                cp.copyto(group["rhs"], group["beta_mrg"])
+                self._solve_group(group, self._cublas.CUBLAS_OP_T)
+            if self._direct_profile_enabled:
+                self._hybrid_profile_events[3].record()
+
+            for group in self._groups:
+                rhs = group["rhs"]
+                rhs += (
+                    sd * noise[group["indices"]][..., None] *
+                    group["valid"][..., None]
+                )
+                quad += cp.sum(rhs * rhs)
+            if self._direct_profile_enabled:
+                self._hybrid_profile_events[4].record()
+
+            for group in self._groups:
+                self._solve_group(group, self._cublas.CUBLAS_OP_N)
+                flat_valid = group["valid"].ravel()
+                self._beta_result[
+                    group["indices"].ravel()[flat_valid]
+                ] = group["rhs"][..., 0].ravel()[flat_valid]
+            if self._direct_profile_enabled:
+                self._hybrid_profile_events[5].record()
+
+            self._potrf_checked = True
+            self._beta_result[self._p] = quad
+            result = cp.asnumpy(self._beta_result)
+
+            if self._direct_profile_enabled:
+                stages = np.zeros(6)
+                stages[0] = cp.cuda.get_elapsed_time(
+                    *self._direct_profile_preamble
+                ) / 1000.0
+                for stage in range(1, 6):
+                    stages[stage] = cp.cuda.get_elapsed_time(
+                        self._hybrid_profile_events[stage - 1],
+                        self._hybrid_profile_events[stage],
+                    ) / 1000.0
+                if self._direct_profile_calls:
+                    self._direct_profile_stage_totals += stages
+                    self._direct_profile_host_total += (
+                        time.perf_counter() - profile_started
+                    )
+                self._direct_profile_calls += 1
+
+        return result[:self._p].reshape(-1, 1), float(result[self._p])
+
+    def describe(self):
+        return (
+            "cuda-hybrid:%d (exact FP64; regular potrf/trsm for %d "
+            "matrices in %d sparse buckets, batched for %d matrices in "
+            "%d buckets; %.1f MiB static resident)" %
+            (
+                self._device.id,
+                self._unbatched_matrices,
+                self._unbatched_groups,
+                self._batched_matrices,
+                self._batched_groups,
+                self._resident_bytes / (1024.0 * 1024.0),
+            )
+        )
+
+    def profile_summary(self):
+        return super().profile_summary().replace(
+            "CUDA direct", "CUDA hybrid", 1
+        )
+
+
 class CudaFp32BetaBackend(CudaDirectBetaBackend):
     """Approximate FP32 direct Cholesky and triangular-solve backend."""
 
@@ -1113,11 +1340,13 @@ def make_beta_backend(backend, ld_blocks, block_sizes, beta_mrg, n_gwas,
         return CudaBetaBackend(**kwargs)
     if backend == "cuda-direct":
         return CudaDirectBetaBackend(**kwargs)
+    if backend == "cuda-hybrid":
+        return CudaHybridBetaBackend(**kwargs)
     if backend == "cuda-fp32":
         return CudaFp32BetaBackend(**kwargs)
     if backend == "cuda-pcg":
         return CudaPcgBetaBackend(**kwargs)
     raise ValueError(
         "unknown beta backend %r; expected 'cpu', 'cuda', 'cuda-direct', "
-        "'cuda-fp32' or 'cuda-pcg'" % backend
+        "'cuda-hybrid', 'cuda-fp32' or 'cuda-pcg'" % backend
     )
