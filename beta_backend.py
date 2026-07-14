@@ -3,6 +3,8 @@
 """CPU and CUDA implementations of the PRS-CS beta block update."""
 
 
+import time
+
 import numpy as np
 from scipy import linalg
 
@@ -433,6 +435,9 @@ class CudaDirectBetaBackend(CudaBetaBackend):
     name = "cuda-direct"
 
     def __init__(self, *args, **kwargs):
+        self._direct_profile_enabled = (
+            str(kwargs.get("profile", "FALSE")).upper() == "TRUE"
+        )
         super().__init__(*args, **kwargs)
         try:
             from cupy.cuda import cublas, device
@@ -448,6 +453,9 @@ class CudaDirectBetaBackend(CudaBetaBackend):
         self._cusolver = cusolver
         self._one = np.array(1.0, dtype=np.float64)
         self._potrf_checked = False
+        self._direct_profile_calls = 0
+        self._direct_profile_host_total = 0.0
+        self._direct_profile_stage_totals = np.zeros(6)
 
         def matrix_pointers(array):
             count = array.shape[0]
@@ -463,6 +471,10 @@ class CudaDirectBetaBackend(CudaBetaBackend):
         with self._device:
             self._cublas_handle = device.get_cublas_handle()
             self._cusolver_handle = device.get_cusolver_handle()
+            if self._direct_profile_enabled:
+                self._direct_profile_preamble = (
+                    cp.cuda.Event(), cp.cuda.Event()
+                )
             for group in self._groups:
                 precision = group["ld"].copy()
                 rhs = cp.empty_like(group["beta_mrg"])
@@ -476,6 +488,10 @@ class CudaDirectBetaBackend(CudaBetaBackend):
                     ),
                 }
                 group.update(direct_arrays)
+                if self._direct_profile_enabled:
+                    group["direct_profile_events"] = [
+                        cp.cuda.Event() for _ in range(6)
+                    ]
                 self._resident_bytes += sum(
                     int(value.nbytes) for value in direct_arrays.values()
                 )
@@ -502,17 +518,27 @@ class CudaDirectBetaBackend(CudaBetaBackend):
     def sample(self, psi, sigma):
         """Draw beta with fixed device workspaces and in-place CUDA calls."""
         cp = self._cp
+        profile_started = (
+            time.perf_counter() if self._direct_profile_enabled else None
+        )
         psi = np.asarray(psi, dtype=np.float64).reshape(-1)
         if psi.size != self._p:
             raise ValueError("psi and beta_mrg must have the same length")
 
         with self._device:
+            if self._direct_profile_enabled:
+                self._direct_profile_preamble[0].record()
             self._psi_device.set(psi)
             quad = cp.zeros((), dtype=cp.float64)
             sd = float(np.sqrt(float(sigma) / self._n_gwas))
             noise = self._rng.standard_normal(self._p, dtype=cp.float64)
+            if self._direct_profile_enabled:
+                self._direct_profile_preamble[1].record()
 
             for group_index, group in enumerate(self._groups):
+                events = group.get("direct_profile_events")
+                if events is not None:
+                    events[0].record()
                 precision = group["precision"]
                 cp.copyto(precision, group["ld"])
                 safe_indices = group["indices"]
@@ -523,6 +549,8 @@ class CudaDirectBetaBackend(CudaBetaBackend):
                 )
                 diag = group["diag"]
                 precision[:, diag, diag] += inv_psi
+                if events is not None:
+                    events[1].record()
 
                 size = precision.shape[-1]
                 count = precision.shape[0]
@@ -535,6 +563,8 @@ class CudaDirectBetaBackend(CudaBetaBackend):
                     group["potrf_info"].data.ptr,
                     count,
                 )
+                if events is not None:
+                    events[2].record()
                 if not self._potrf_checked:
                     info = cp.asnumpy(group["potrf_info"])
                     failures = np.flatnonzero(info)
@@ -553,11 +583,15 @@ class CudaDirectBetaBackend(CudaBetaBackend):
                 self._triangular_solve(
                     group, self._cublas.CUBLAS_OP_T
                 )
+                if events is not None:
+                    events[3].record()
                 rhs += (
                     sd * noise[group["indices"]][..., None] *
                     group["valid"][..., None]
                 )
                 quad += cp.sum(rhs * rhs)
+                if events is not None:
+                    events[4].record()
 
                 # U beta=y is the second solve L.T beta=y.
                 self._triangular_solve(
@@ -567,10 +601,30 @@ class CudaDirectBetaBackend(CudaBetaBackend):
                 self._beta_result[
                     group["indices"].ravel()[flat_valid]
                 ] = rhs[..., 0].ravel()[flat_valid]
+                if events is not None:
+                    events[5].record()
 
             self._potrf_checked = True
             self._beta_result[self._p] = quad
             result = cp.asnumpy(self._beta_result)
+
+            if self._direct_profile_enabled:
+                stages = np.zeros(6)
+                stages[0] = cp.cuda.get_elapsed_time(
+                    *self._direct_profile_preamble
+                ) / 1000.0
+                for group in self._groups:
+                    events = group["direct_profile_events"]
+                    for stage in range(1, 6):
+                        stages[stage] += cp.cuda.get_elapsed_time(
+                            events[stage - 1], events[stage]
+                        ) / 1000.0
+                if self._direct_profile_calls:
+                    self._direct_profile_stage_totals += stages
+                    self._direct_profile_host_total += (
+                        time.perf_counter() - profile_started
+                    )
+                self._direct_profile_calls += 1
 
         return result[:self._p].reshape(-1, 1), float(result[self._p])
 
@@ -583,6 +637,23 @@ class CudaDirectBetaBackend(CudaBetaBackend):
                 len(self._groups),
                 self._resident_bytes / (1024.0 * 1024.0),
             )
+        )
+
+    def profile_summary(self):
+        measured = self._direct_profile_calls - 1
+        if not self._direct_profile_enabled:
+            return "CUDA direct stage profiling disabled"
+        if measured < 1:
+            return "CUDA direct stages: no steady-state draws recorded"
+        means = 1000.0 * self._direct_profile_stage_totals / measured
+        host_mean = 1000.0 * self._direct_profile_host_total / measured
+        unattributed = max(host_mean - float(means.sum()), 0.0)
+        return (
+            "CUDA direct stages (mean): preamble %.3f ms, "
+            "precision %.3f ms, potrf %.3f ms, solve-1 %.3f ms, "
+            "perturb/quad %.3f ms, solve-2/scatter %.3f ms, "
+            "host/unattributed %.3f ms" %
+            (*means, unattributed)
         )
 
 
@@ -972,7 +1043,7 @@ def make_beta_backend(backend, ld_blocks, block_sizes, beta_mrg, n_gwas,
                       seed=None, cuda_device=0, cuda_bucket_size=32,
                       pcg_tol=1e-10, pcg_maxiter=100,
                       pcg_check_interval=4, ld_rank_tol=1e-8,
-                      ld_factors=None, ld_eigenvalues=None):
+                      ld_factors=None, ld_eigenvalues=None, profile="FALSE"):
     """Construct a beta sampler without importing CUDA dependencies on CPU."""
     backend = str(backend).lower()
     kwargs = {
@@ -989,6 +1060,7 @@ def make_beta_backend(backend, ld_blocks, block_sizes, beta_mrg, n_gwas,
         "ld_rank_tol": ld_rank_tol,
         "ld_factors": ld_factors,
         "ld_eigenvalues": ld_eigenvalues,
+        "profile": profile,
     }
     if backend == "cpu":
         return CpuBetaBackend(**kwargs)

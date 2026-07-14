@@ -61,6 +61,7 @@ def mcmc(a, b, phi, sst_dict, n, ld_blk, blk_size, n_iter, n_burnin, thin, chrom
         ld_rank_tol=ld_rank_tol,
         ld_factors=ld_factors,
         ld_eigenvalues=ld_eigenvalues,
+        profile=profile,
     )
     print('... beta backend: %s ...' % beta_backend.describe())
     psi_sampler = make_psi_backend(

@@ -239,6 +239,8 @@ python PRScs.py ... --chrom=22 --backend=cuda --cuda_device=0 --profile=True
 python PRScs.py ... --chrom=22 --backend=cuda-direct --psi_backend=cuda-fused --profile=True
 ```
 
+With `cuda-direct`, `--profile=True` also reports CUDA-event timings for precision-matrix assembly, Cholesky, both triangular solves, perturbation/scatter work, and host or synchronization overhead. These diagnostic events add a small amount of overhead and are intended for profiling rather than final production timing.
+
 `cuda-pcg` draws an exact Gaussian perturbation and solves the resulting precision systems with diagonally preconditioned FP64 conjugate gradients:
 
 ```
