@@ -11,7 +11,8 @@ Reference: T Ge, CY Chen, Y Ni, YCA Feng, JW Smoller. Polygenic Prediction via B
 Usage:
 python PRScs.py --ref_dir=PATH_TO_REFERENCE --bim_prefix=VALIDATION_BIM_PREFIX --sst_file=SUM_STATS_FILE --n_gwas=GWAS_SAMPLE_SIZE --out_dir=OUTPUT_DIR
                 [--a=PARAM_A --b=PARAM_B --phi=PARAM_PHI --n_iter=MCMC_ITERATIONS --n_burnin=MCMC_BURNIN --thin=MCMC_THINNING_FACTOR
-                 --chrom=CHROM --write_psi=WRITE_PSI --write_pst=WRITE_POSTERIOR_SAMPLES --seed=SEED]
+                 --chrom=CHROM --write_psi=WRITE_PSI --write_pst=WRITE_POSTERIOR_SAMPLES --seed=SEED
+                 --backend=cpu|cuda --cuda_device=DEVICE --cuda_bucket_size=SIZE --profile=TRUE|FALSE]
 
 """
 
@@ -22,16 +23,18 @@ import getopt
 
 import parse_genet
 import mcmc_gtb
-import gigrnd
 
 
 def parse_param():
     long_opts_list = ['ref_dir=', 'bim_prefix=', 'sst_file=', 'a=', 'b=', 'phi=', 'n_gwas=',
                       'n_iter=', 'n_burnin=', 'thin=', 'out_dir=', 'chrom=', 'beta_std=', 'write_psi=', 'write_pst=', 'seed=', 'help']
 
+    long_opts_list += ['backend=', 'cuda_device=', 'cuda_bucket_size=', 'profile=']
+
     param_dict = {'ref_dir': None, 'bim_prefix': None, 'sst_file': None, 'a': 1, 'b': 0.5, 'phi': None, 'n_gwas': None,
                   'n_iter': 1000, 'n_burnin': 500, 'thin': 5, 'out_dir': None, 'chrom': range(1,23),
-                  'beta_std': 'FALSE', 'write_psi': 'FALSE', 'write_pst': 'FALSE', 'seed': None}
+                  'beta_std': 'FALSE', 'write_psi': 'FALSE', 'write_pst': 'FALSE', 'seed': None,
+                  'backend': 'cpu', 'cuda_device': 0, 'cuda_bucket_size': 32, 'profile': 'FALSE'}
 
     print('\n')
 
@@ -63,6 +66,10 @@ def parse_param():
             elif opt == "--write_psi": param_dict['write_psi'] = arg.upper()
             elif opt == "--write_pst": param_dict['write_pst'] = arg.upper()
             elif opt == "--seed": param_dict['seed'] = int(arg)
+            elif opt == "--backend": param_dict['backend'] = arg.lower()
+            elif opt == "--cuda_device": param_dict['cuda_device'] = int(arg)
+            elif opt == "--cuda_bucket_size": param_dict['cuda_bucket_size'] = int(arg)
+            elif opt == "--profile": param_dict['profile'] = arg.upper()
     else:
         print(__doc__)
         sys.exit(0)
@@ -81,6 +88,18 @@ def parse_param():
         sys.exit(2)
     elif param_dict['out_dir'] == None:
         print('* Please specify the output directory using --out_dir\n')
+        sys.exit(2)
+    elif param_dict['backend'] not in ('cpu', 'cuda'):
+        print('* --backend must be either cpu or cuda\n')
+        sys.exit(2)
+    elif param_dict['cuda_device'] < 0:
+        print('* --cuda_device must be non-negative\n')
+        sys.exit(2)
+    elif param_dict['cuda_bucket_size'] < 1:
+        print('* --cuda_bucket_size must be at least 1\n')
+        sys.exit(2)
+    elif param_dict['profile'] not in ('TRUE', 'FALSE'):
+        print('* --profile must be True or False\n')
         sys.exit(2)
 
     for key in param_dict:
@@ -109,12 +128,11 @@ def main():
 
         mcmc_gtb.mcmc(param_dict['a'], param_dict['b'], param_dict['phi'], sst_dict, param_dict['n_gwas'], ld_blk, blk_size,
             param_dict['n_iter'], param_dict['n_burnin'], param_dict['thin'], int(chrom), param_dict['out_dir'], param_dict['beta_std'],
-	    param_dict['write_psi'], param_dict['write_pst'], param_dict['seed'])
+	    param_dict['write_psi'], param_dict['write_pst'], param_dict['seed'], param_dict['backend'],
+	    param_dict['cuda_device'], param_dict['cuda_bucket_size'], param_dict['profile'])
 
         print('\n')
 
 
 if __name__ == '__main__':
     main()
-
-

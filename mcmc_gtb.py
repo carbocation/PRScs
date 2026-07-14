@@ -6,24 +6,27 @@ Markov Chain Monte Carlo (MCMC) sampler for polygenic prediction with continuous
 """
 
 
+import time
+
 import numpy as np
-from scipy import linalg 
 import gigrnd
+from beta_backend import make_beta_backend
 
 
-def mcmc(a, b, phi, sst_dict, n, ld_blk, blk_size, n_iter, n_burnin, thin, chrom, out_dir, beta_std, write_psi, write_pst, seed):
+def mcmc(a, b, phi, sst_dict, n, ld_blk, blk_size, n_iter, n_burnin, thin, chrom, out_dir, beta_std, write_psi, write_pst, seed,
+         backend='cpu', cuda_device=0, cuda_bucket_size=32, profile='FALSE'):
     print('... MCMC ...')
 
     # seed
     if seed is not None:
         np.random.seed(seed)
+        gigrnd.seed_rng(seed)
 
     # derived stats
     beta_mrg = np.array(sst_dict['BETA'], ndmin=2).T
     maf = np.array(sst_dict['MAF'], ndmin=2).T
     n_pst = int((n_iter-n_burnin)/thin)
     p = len(sst_dict['SNP'])
-    n_blk = len(ld_blk)
 
     # initialization
     beta = np.zeros((p,1))
@@ -43,25 +46,29 @@ def mcmc(a, b, phi, sst_dict, n, ld_blk, blk_size, n_iter, n_burnin, thin, chrom
     sigma_est = 0.0
     phi_est = 0.0
 
+    beta_backend = make_beta_backend(
+        backend, ld_blk, blk_size, beta_mrg, n,
+        seed=seed,
+        cuda_device=cuda_device,
+        cuda_bucket_size=cuda_bucket_size,
+    )
+    print('... beta backend: %s ...' % beta_backend.describe())
+    profile = str(profile).upper() == 'TRUE'
+    profile_beta = 0.0
+    profile_psi = 0.0
+    profile_total = 0.0
+    profile_iterations = 0
+
     # MCMC
     pp = 0
     for itr in range(1,n_iter+1):
+        iteration_start = time.perf_counter()
         if itr % 100 == 0:
             print('--- iter-' + str(itr) + ' ---')
 
-        mm = 0; quad = 0.0
-        for kk in range(n_blk):
-            if blk_size[kk] == 0:
-                continue
-            else:
-                idx_blk = range(mm,mm+blk_size[kk])
-                dinvt = ld_blk[kk]+np.diag(1.0/psi[idx_blk].T[0])
-                dinvt_chol = linalg.cholesky(dinvt)
-                sd = float(np.sqrt(sigma / n))
-                beta_tmp = linalg.solve_triangular(dinvt_chol, beta_mrg[idx_blk], trans='T') + sd*np.random.randn(len(idx_blk),1)
-                beta[idx_blk] = linalg.solve_triangular(dinvt_chol, beta_tmp, trans='N')
-                quad += float(np.dot(np.dot(beta[idx_blk].T, dinvt), beta[idx_blk]))
-                mm += blk_size[kk]
+        beta_start = time.perf_counter()
+        beta, quad = beta_backend.sample(psi, sigma)
+        beta_elapsed = time.perf_counter() - beta_start
 
         s1 = float((beta * beta_mrg).sum())
         s2 = float((beta**2 / psi).sum())
@@ -74,22 +81,22 @@ def mcmc(a, b, phi, sst_dict, n, ld_blk, blk_size, n_iter, n_burnin, thin, chrom
 
         delta = np.random.gamma(a+b, 1.0/(psi+phi))
 
-        for jj in range(p):
-            delta_val = delta[jj, 0].item()
-            beta_val  = beta[jj,  0].item()
-
-            # compute ψ_j as a float and store back into the (p,1) array
-            psi[jj, 0] = gigrnd.gigrnd(
-                float(a - 0.5),
-                float(2.0 * delta_val),
-                float(n * (beta_val**2) / sigma)
-            )
+        psi_start = time.perf_counter()
+        gigrnd.gig_rvs_vec(
+            psi[:, 0],
+            float(a - 0.5),
+            delta[:, 0],
+            beta[:, 0],
+            float(sigma),
+            int(n),
+        )
+        psi_elapsed = time.perf_counter() - psi_start
         
         psi[psi>1] = 1.0
 
         if phi_updt == True:
             w = np.random.gamma(1.0, 1.0/(phi+1.0))
-            phi = np.random.gamma(p*b+0.5, 1.0/(sum(delta)+w))
+            phi = np.random.gamma(p*b+0.5, 1.0/(float(delta.sum())+w))
 
         # posterior
         if (itr>n_burnin) and (itr % thin == 0):
@@ -101,6 +108,25 @@ def mcmc(a, b, phi, sst_dict, n, ld_blk, blk_size, n_iter, n_burnin, thin, chrom
             if write_pst == 'TRUE':
                 beta_pst[:,[pp]] = beta
                 pp += 1
+
+        iteration_elapsed = time.perf_counter() - iteration_start
+        if profile:
+            if itr > 1:
+                profile_beta += beta_elapsed
+                profile_psi += psi_elapsed
+                profile_total += iteration_elapsed
+                profile_iterations += 1
+            if itr == 1:
+                print('[PROFILE chr%d] iter 1 warm-up: beta %.4fs, psi %.4fs, total %.4fs' %
+                      (chrom, beta_elapsed, psi_elapsed, iteration_elapsed))
+            elif itr % 10 == 0 or itr == n_iter:
+                other = profile_total - profile_beta - profile_psi
+                print('[PROFILE chr%d] steady-state mean over %d iter: beta %.4fs, psi %.4fs, other %.4fs, total %.4fs' %
+                      (chrom, profile_iterations,
+                       profile_beta/profile_iterations,
+                       profile_psi/profile_iterations,
+                       other/profile_iterations,
+                       profile_total/profile_iterations))
 
     # convert standardized beta to per-allele beta
     if beta_std == 'FALSE':
@@ -122,7 +148,8 @@ def mcmc(a, b, phi, sst_dict, n, ld_blk, blk_size, n_iter, n_burnin, thin, chrom
                 ff.write(('%d\t%s\t%d\t%s\t%s' + '\t%.6e'*n_pst + '\n') % (chrom, snp, bp, a1, a2, *beta))
         else:
             for snp, bp, a1, a2, beta in zip(sst_dict['SNP'], sst_dict['BP'], sst_dict['A1'], sst_dict['A2'], beta_est):
-                ff.write('%d\t%s\t%d\t%s\t%s\t%.6e\n' % (chrom, snp, bp, a1, a2, beta))
+                ff.write('%d\t%s\t%d\t%s\t%s\t%.6e\n' %
+                         (chrom, snp, bp, a1, a2, beta.item()))
 
     # write posterior estimates of psi
     if write_psi == 'TRUE':
@@ -133,12 +160,10 @@ def mcmc(a, b, phi, sst_dict, n, ld_blk, blk_size, n_iter, n_burnin, thin, chrom
 
         with open(psi_file, 'w') as ff:
             for snp, psi in zip(sst_dict['SNP'], psi_est):
-                ff.write('%s\t%.6e\n' % (snp, psi))
+                ff.write('%s\t%.6e\n' % (snp, psi.item()))
 
     # print estimated phi
     if phi_updt == True:
         print('... Estimated global shrinkage parameter: %1.2e ...' % phi_est )
 
     print('... Done ...')
-
-
