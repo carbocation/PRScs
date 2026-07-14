@@ -25,6 +25,53 @@ def _destroy_stream_handles(cublas, cusolver, cublas_handles,
             pass
 
 
+_CUDA_STREAM_KERNEL_SOURCE = r"""
+extern "C" __global__
+void assemble_precision(
+        const double* ld,
+        const long long* indices,
+        const unsigned char* valid,
+        const double* psi,
+        double* precision,
+        const unsigned long long entries,
+        const int size) {
+    const unsigned long long offset =
+        (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (offset >= entries) return;
+
+    const int column = (int)(offset % (unsigned long long)size);
+    const int row = (int)(
+        (offset / (unsigned long long)size) % (unsigned long long)size
+    );
+    double value = ld[offset];
+    if (row == column) {
+        const unsigned long long matrix = offset /
+            ((unsigned long long)size * (unsigned long long)size);
+        const unsigned long long vector_offset =
+            matrix * (unsigned long long)size + (unsigned long long)row;
+        if (valid[vector_offset]) {
+            value += 1.0 / psi[indices[vector_offset]];
+        }
+    }
+    precision[offset] = value;
+}
+
+extern "C" __global__
+void scatter_beta(
+        const double* rhs,
+        const long long* indices,
+        const unsigned char* valid,
+        double* beta,
+        const unsigned long long entries) {
+    const unsigned long long offset =
+        (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (offset < entries && valid[offset]) {
+        beta[indices[offset]] = rhs[offset];
+    }
+}
+"""
+
+
 def _block_layout(ld_blocks, block_sizes, p):
     """Validate block inputs and return (block_index, slice) pairs."""
     if len(ld_blocks) != len(block_sizes):
@@ -970,6 +1017,19 @@ class CudaStreamsBetaBackend(CudaHybridBetaBackend):
         self._lane_cusolver_handles = []
         try:
             with self._device:
+                self._stream_kernel_module = cp.RawModule(
+                    code=_CUDA_STREAM_KERNEL_SOURCE,
+                    options=("--std=c++11",),
+                )
+                self._assemble_precision_kernel = (
+                    self._stream_kernel_module.get_function(
+                        "assemble_precision"
+                    )
+                )
+                self._scatter_beta_kernel = (
+                    self._stream_kernel_module.get_function("scatter_beta")
+                )
+                self._kernel_threads = 256
                 self._streams = [
                     cp.cuda.Stream(non_blocking=True)
                     for _ in range(self._stream_count)
@@ -1069,16 +1129,24 @@ class CudaStreamsBetaBackend(CudaHybridBetaBackend):
             default_stream.record(self._stream_boundaries[0])
 
             def assemble_precision(_lane, group):
-                precision = group["precision"]
-                cp.copyto(precision, group["ld"])
-                safe_indices = group["indices"]
-                inv_psi = cp.where(
-                    group["valid"],
-                    1.0 / self._psi_device[safe_indices],
-                    0.0,
+                entries = int(group["precision"].size)
+                blocks = (
+                    (entries + self._kernel_threads - 1) //
+                    self._kernel_threads
                 )
-                diag = group["diag"]
-                precision[:, diag, diag] += inv_psi
+                self._assemble_precision_kernel(
+                    (blocks,),
+                    (self._kernel_threads,),
+                    (
+                        group["ld"],
+                        group["indices"],
+                        group["valid"],
+                        self._psi_device,
+                        group["precision"],
+                        np.uint64(entries),
+                        np.int32(group["precision"].shape[-1]),
+                    ),
+                )
 
             self._dispatch_stage(0, assemble_precision)
 
@@ -1129,10 +1197,22 @@ class CudaStreamsBetaBackend(CudaHybridBetaBackend):
                     self._cublas.CUBLAS_OP_N,
                     self._lane_cublas_handles[lane],
                 )
-                flat_valid = group["valid"].ravel()
-                self._beta_result[
-                    group["indices"].ravel()[flat_valid]
-                ] = group["rhs"][..., 0].ravel()[flat_valid]
+                entries = int(group["indices"].size)
+                blocks = (
+                    (entries + self._kernel_threads - 1) //
+                    self._kernel_threads
+                )
+                self._scatter_beta_kernel(
+                    (blocks,),
+                    (self._kernel_threads,),
+                    (
+                        group["rhs"],
+                        group["indices"],
+                        group["valid"],
+                        self._beta_result,
+                        np.uint64(entries),
+                    ),
+                )
 
             self._dispatch_stage(4, solve_second)
 
@@ -1162,8 +1242,8 @@ class CudaStreamsBetaBackend(CudaHybridBetaBackend):
     def describe(self):
         return (
             "cuda-streams:%d (exact FP64; %d concurrent streams, "
-            "%d regular and %d batched matrices; %.1f MiB static "
-            "resident)" %
+            "fused assembly/scatter; %d regular and %d batched matrices; "
+            "%.1f MiB static resident)" %
             (
                 self._device.id,
                 self._stream_count,
