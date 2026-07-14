@@ -14,7 +14,9 @@ python PRScs.py --ref_dir=PATH_TO_REFERENCE --bim_prefix=VALIDATION_BIM_PREFIX -
                  --chrom=CHROM --write_psi=WRITE_PSI --write_pst=WRITE_POSTERIOR_SAMPLES --seed=SEED
                  --backend=cpu|cuda|cuda-pcg --cuda_device=DEVICE --cuda_bucket_size=SIZE
                  --pcg_tol=TOL --pcg_maxiter=ITERATIONS --pcg_check_interval=ITERATIONS
-                 --ld_diagnostics=TRUE|FALSE --ld_rank_tol=TOL --profile=TRUE|FALSE]
+                 --ld_diagnostics=TRUE|FALSE --ld_rank_tol=TOL
+                 --psi_backend=cpu|cuda --cuda_gig_max_rounds=ROUNDS
+                 --profile=TRUE|FALSE]
 
 """
 
@@ -34,7 +36,8 @@ def parse_param():
     long_opts_list += [
         'backend=', 'cuda_device=', 'cuda_bucket_size=', 'profile=',
         'pcg_tol=', 'pcg_maxiter=', 'pcg_check_interval=',
-        'ld_diagnostics=', 'ld_rank_tol=',
+        'ld_diagnostics=', 'ld_rank_tol=', 'psi_backend=',
+        'cuda_gig_max_rounds=',
     ]
 
     param_dict = {'ref_dir': None, 'bim_prefix': None, 'sst_file': None, 'a': 1, 'b': 0.5, 'phi': None, 'n_gwas': None,
@@ -43,7 +46,8 @@ def parse_param():
                   'backend': 'cpu', 'cuda_device': 0, 'cuda_bucket_size': 32, 'profile': 'FALSE',
                   'pcg_tol': 1e-10, 'pcg_maxiter': 100,
                   'pcg_check_interval': 4, 'ld_diagnostics': 'FALSE',
-                  'ld_rank_tol': 1e-8}
+                  'ld_rank_tol': 1e-8, 'psi_backend': 'cpu',
+                  'cuda_gig_max_rounds': 1000}
 
     print('\n')
 
@@ -84,6 +88,8 @@ def parse_param():
             elif opt == "--pcg_check_interval": param_dict['pcg_check_interval'] = int(arg)
             elif opt == "--ld_diagnostics": param_dict['ld_diagnostics'] = arg.upper()
             elif opt == "--ld_rank_tol": param_dict['ld_rank_tol'] = float(arg)
+            elif opt == "--psi_backend": param_dict['psi_backend'] = arg.lower()
+            elif opt == "--cuda_gig_max_rounds": param_dict['cuda_gig_max_rounds'] = int(arg)
     else:
         print(__doc__)
         sys.exit(0)
@@ -129,6 +135,12 @@ def parse_param():
         sys.exit(2)
     elif not 0 <= param_dict['ld_rank_tol'] < 1:
         print('* --ld_rank_tol must be in [0, 1)\n')
+        sys.exit(2)
+    elif param_dict['psi_backend'] not in ('cpu', 'cuda'):
+        print('* --psi_backend must be cpu or cuda\n')
+        sys.exit(2)
+    elif param_dict['cuda_gig_max_rounds'] < 1:
+        print('* --cuda_gig_max_rounds must be at least 1\n')
         sys.exit(2)
 
     for key in param_dict:
@@ -191,6 +203,8 @@ def main():
             pcg_check_interval=param_dict['pcg_check_interval'],
             ld_rank_tol=param_dict['ld_rank_tol'],
             ld_factors=ld_factors, ld_eigenvalues=ld_eigenvalues,
+            psi_backend=param_dict['psi_backend'],
+            cuda_gig_max_rounds=param_dict['cuda_gig_max_rounds'],
         )
 
         print('\n')

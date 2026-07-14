@@ -11,12 +11,14 @@ import time
 import numpy as np
 import gigrnd
 from beta_backend import make_beta_backend
+from psi_backend import make_psi_backend
 
 
 def mcmc(a, b, phi, sst_dict, n, ld_blk, blk_size, n_iter, n_burnin, thin, chrom, out_dir, beta_std, write_psi, write_pst, seed,
          backend='cpu', cuda_device=0, cuda_bucket_size=32, profile='FALSE',
          pcg_tol=1e-10, pcg_maxiter=100, pcg_check_interval=4,
-         ld_rank_tol=1e-8, ld_factors=None, ld_eigenvalues=None):
+         ld_rank_tol=1e-8, ld_factors=None, ld_eigenvalues=None,
+         psi_backend='cpu', cuda_gig_max_rounds=1000):
     print('... MCMC ...')
 
     # seed
@@ -61,6 +63,11 @@ def mcmc(a, b, phi, sst_dict, n, ld_blk, blk_size, n_iter, n_burnin, thin, chrom
         ld_eigenvalues=ld_eigenvalues,
     )
     print('... beta backend: %s ...' % beta_backend.describe())
+    psi_sampler = make_psi_backend(
+        psi_backend, p, seed=seed, cuda_device=cuda_device,
+        cuda_gig_max_rounds=cuda_gig_max_rounds,
+    )
+    print('... psi backend: %s ...' % psi_sampler.describe())
     profile = str(profile).upper() == 'TRUE'
     profile_beta = 0.0
     profile_psi = 0.0
@@ -90,7 +97,7 @@ def mcmc(a, b, phi, sst_dict, n, ld_blk, blk_size, n_iter, n_burnin, thin, chrom
         delta = np.random.gamma(a+b, 1.0/(psi+phi))
 
         psi_start = time.perf_counter()
-        gigrnd.gig_rvs_vec(
+        psi_sampler.sample(
             psi[:, 0],
             float(a - 0.5),
             delta[:, 0],
@@ -177,5 +184,8 @@ def mcmc(a, b, phi, sst_dict, n, ld_blk, blk_size, n_iter, n_burnin, thin, chrom
     if profile and hasattr(beta_backend, 'profile_summary'):
         print('[PROFILE chr%d] %s' %
               (chrom, beta_backend.profile_summary()))
+    if profile and hasattr(psi_sampler, 'profile_summary'):
+        print('[PROFILE chr%d] %s' %
+              (chrom, psi_sampler.profile_summary()))
 
     print('... Done ...')
