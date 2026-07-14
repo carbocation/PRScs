@@ -855,16 +855,25 @@ class CudaHybridBetaBackend(CudaDirectBetaBackend):
             return
 
         for matrix_index in range(count):
-            self._potrf_single(
-                cusolver_handle,
-                self._cublas.CUBLAS_FILL_MODE_UPPER,
-                size,
-                group["precision"][matrix_index].data.ptr,
-                size,
-                workspace.data.ptr,
-                group["single_lwork"],
-                group["potrf_info"][matrix_index:].data.ptr,
+            self._factor_matrix(
+                group, matrix_index, cusolver_handle, workspace
             )
+
+    def _factor_matrix(self, group, matrix_index, cusolver_handle,
+                       workspace):
+        size = int(group["precision"].shape[-1])
+        self._potrf_single(
+            cusolver_handle,
+            self._cublas.CUBLAS_FILL_MODE_UPPER,
+            size,
+            group["precision"][matrix_index].data.ptr,
+            size,
+            workspace.data.ptr,
+            group["single_lwork"],
+            group["potrf_info"][
+                matrix_index:matrix_index + 1
+            ].data.ptr,
+        )
 
     def _solve_group(self, group, trans, cublas_handle=None):
         if cublas_handle is None:
@@ -875,23 +884,28 @@ class CudaHybridBetaBackend(CudaDirectBetaBackend):
             )
             return
 
-        size = int(group["precision"].shape[-1])
         count = int(group["precision"].shape[0])
         for matrix_index in range(count):
-            self._trsm_single(
-                cublas_handle,
-                self._cublas.CUBLAS_SIDE_LEFT,
-                self._cublas.CUBLAS_FILL_MODE_UPPER,
-                trans,
-                self._cublas.CUBLAS_DIAG_NON_UNIT,
-                size,
-                1,
-                self._one.ctypes.data,
-                group["precision"][matrix_index].data.ptr,
-                size,
-                group["rhs"][matrix_index].data.ptr,
-                size,
+            self._solve_matrix(
+                group, matrix_index, trans, cublas_handle
             )
+
+    def _solve_matrix(self, group, matrix_index, trans, cublas_handle):
+        size = int(group["precision"].shape[-1])
+        self._trsm_single(
+            cublas_handle,
+            self._cublas.CUBLAS_SIDE_LEFT,
+            self._cublas.CUBLAS_FILL_MODE_UPPER,
+            trans,
+            self._cublas.CUBLAS_DIAG_NON_UNIT,
+            size,
+            1,
+            self._one.ctypes.data,
+            group["precision"][matrix_index].data.ptr,
+            size,
+            group["rhs"][matrix_index].data.ptr,
+            size,
+        )
 
     def sample(self, psi, sigma):
         """Draw beta with regular dense routines for sparse size buckets."""
@@ -1032,24 +1046,48 @@ class CudaStreamsBetaBackend(CudaHybridBetaBackend):
             )
 
         cp = self._cp
-        self._stream_count = min(requested_streams, len(self._groups))
-        self._lane_groups = [[] for _ in range(self._stream_count)]
-        lane_work = [0] * self._stream_count
-        ranked_groups = sorted(
-            self._groups,
-            key=lambda group: (
-                int(group["precision"].shape[0]) *
-                int(group["precision"].shape[-1]) ** 3
-            ),
-            reverse=True,
-        )
-        for group in ranked_groups:
-            lane = min(range(self._stream_count), key=lane_work.__getitem__)
-            self._lane_groups[lane].append(group)
-            lane_work[lane] += (
-                int(group["precision"].shape[0]) *
-                int(group["precision"].shape[-1]) ** 3
+        solver_tasks = []
+        for group in self._groups:
+            count = int(group["precision"].shape[0])
+            if group["use_unbatched"]:
+                solver_tasks.extend(
+                    (group, matrix_index)
+                    for matrix_index in range(count)
+                )
+            else:
+                solver_tasks.append((group, None))
+
+        self._solver_task_count = len(solver_tasks)
+        self._stream_count = min(requested_streams, self._solver_task_count)
+
+        def distribute(items, cost):
+            lanes = [[] for _ in range(self._stream_count)]
+            lane_work = [0] * self._stream_count
+            for item in sorted(items, key=cost, reverse=True):
+                lane = min(
+                    range(self._stream_count), key=lane_work.__getitem__
+                )
+                lanes[lane].append(item)
+                lane_work[lane] += cost(item)
+            return lanes
+
+        def solver_cost(task):
+            group, matrix_index = task
+            size = int(group["precision"].shape[-1])
+            count = (
+                int(group["precision"].shape[0])
+                if matrix_index is None else 1
             )
+            return count * size ** 3
+
+        self._lane_solver_tasks = distribute(solver_tasks, solver_cost)
+        self._lane_groups = distribute(
+            self._groups,
+            lambda group: (
+                int(group["precision"].shape[0]) *
+                int(group["precision"].shape[-1]) ** 2
+            ),
+        )
 
         self._lane_cublas_handles = []
         self._lane_cusolver_handles = []
@@ -1084,11 +1122,12 @@ class CudaStreamsBetaBackend(CudaHybridBetaBackend):
                     self._cusolver.setStream(cusolver_handle, stream.ptr)
 
                 self._lane_workspaces = []
-                for groups in self._lane_groups:
+                for tasks in self._lane_solver_tasks:
                     maximum_lwork = max(
                         (
                             int(group.get("single_lwork", 0))
-                            for group in groups
+                            for group, matrix_index in tasks
+                            if matrix_index is not None
                         ),
                         default=0,
                     )
@@ -1139,14 +1178,14 @@ class CudaStreamsBetaBackend(CudaHybridBetaBackend):
             self._lane_cusolver_handles,
         )
 
-    def _dispatch_stage(self, stage_index, operation):
+    def _dispatch_stage(self, stage_index, lane_items, operation):
         default_stream = self._cp.cuda.get_current_stream()
-        for lane, (stream, groups) in enumerate(zip(
-                self._streams, self._lane_groups)):
+        for lane, (stream, items) in enumerate(zip(
+                self._streams, lane_items)):
             with stream:
                 stream.wait_event(self._stream_boundaries[stage_index])
-                for group in groups:
-                    operation(lane, group)
+                for item in items:
+                    operation(lane, item)
                 stream.record(self._lane_completion[stage_index][lane])
 
         for event in self._lane_completion[stage_index]:
@@ -1196,16 +1235,29 @@ class CudaStreamsBetaBackend(CudaHybridBetaBackend):
                     ),
                 )
 
-            self._dispatch_stage(0, assemble_precision)
+            self._dispatch_stage(
+                0, self._lane_groups, assemble_precision
+            )
 
-            def factor(lane, group):
-                self._factor_group(
-                    group,
-                    self._lane_cusolver_handles[lane],
-                    self._lane_workspaces[lane],
-                )
+            def factor(lane, task):
+                group, matrix_index = task
+                if matrix_index is None:
+                    self._factor_group(
+                        group,
+                        self._lane_cusolver_handles[lane],
+                        self._lane_workspaces[lane],
+                    )
+                else:
+                    self._factor_matrix(
+                        group,
+                        matrix_index,
+                        self._lane_cusolver_handles[lane],
+                        self._lane_workspaces[lane],
+                    )
 
-            self._dispatch_stage(1, factor)
+            self._dispatch_stage(
+                1, self._lane_solver_tasks, factor
+            )
 
             if not self._potrf_checked:
                 for group_index, group in enumerate(self._groups):
@@ -1219,15 +1271,30 @@ class CudaStreamsBetaBackend(CudaHybridBetaBackend):
                             (group_index, first, int(info[first]))
                         )
 
-            def solve_first(lane, group):
-                cp.copyto(group["rhs"], group["beta_mrg"])
-                self._solve_group(
-                    group,
-                    self._cublas.CUBLAS_OP_T,
-                    self._lane_cublas_handles[lane],
-                )
+            def solve_first(lane, task):
+                group, matrix_index = task
+                if matrix_index is None:
+                    cp.copyto(group["rhs"], group["beta_mrg"])
+                    self._solve_group(
+                        group,
+                        self._cublas.CUBLAS_OP_T,
+                        self._lane_cublas_handles[lane],
+                    )
+                else:
+                    cp.copyto(
+                        group["rhs"][matrix_index],
+                        group["beta_mrg"][matrix_index],
+                    )
+                    self._solve_matrix(
+                        group,
+                        matrix_index,
+                        self._cublas.CUBLAS_OP_T,
+                        self._lane_cublas_handles[lane],
+                    )
 
-            self._dispatch_stage(2, solve_first)
+            self._dispatch_stage(
+                2, self._lane_solver_tasks, solve_first
+            )
 
             def perturb(_lane, group):
                 self._perturb_quad_kernel(
@@ -1247,15 +1314,31 @@ class CudaStreamsBetaBackend(CudaHybridBetaBackend):
                     ),
                 )
 
-            self._dispatch_stage(3, perturb)
+            self._dispatch_stage(3, self._lane_groups, perturb)
 
-            def solve_second(lane, group):
-                self._solve_group(
-                    group,
-                    self._cublas.CUBLAS_OP_N,
-                    self._lane_cublas_handles[lane],
-                )
-                entries = int(group["indices"].size)
+            def solve_second(lane, task):
+                group, matrix_index = task
+                if matrix_index is None:
+                    self._solve_group(
+                        group,
+                        self._cublas.CUBLAS_OP_N,
+                        self._lane_cublas_handles[lane],
+                    )
+                    rhs = group["rhs"]
+                    indices = group["indices"]
+                    valid = group["valid"]
+                else:
+                    self._solve_matrix(
+                        group,
+                        matrix_index,
+                        self._cublas.CUBLAS_OP_N,
+                        self._lane_cublas_handles[lane],
+                    )
+                    rhs = group["rhs"][matrix_index]
+                    indices = group["indices"][matrix_index]
+                    valid = group["valid"][matrix_index]
+
+                entries = int(indices.size)
                 blocks = (
                     (entries + self._kernel_threads - 1) //
                     self._kernel_threads
@@ -1264,15 +1347,17 @@ class CudaStreamsBetaBackend(CudaHybridBetaBackend):
                     (blocks,),
                     (self._kernel_threads,),
                     (
-                        group["rhs"],
-                        group["indices"],
-                        group["valid"],
+                        rhs,
+                        indices,
+                        valid,
                         self._beta_result,
                         np.uint64(entries),
                     ),
                 )
 
-            self._dispatch_stage(4, solve_second)
+            self._dispatch_stage(
+                4, self._lane_solver_tasks, solve_second
+            )
 
             self._potrf_checked = True
             self._beta_result[self._p] = cp.sum(self._quad_matrices)
@@ -1298,13 +1383,19 @@ class CudaStreamsBetaBackend(CudaHybridBetaBackend):
         return result[:self._p].reshape(-1, 1), float(result[self._p])
 
     def describe(self):
+        stream_word = "stream" if self._stream_count == 1 else "streams"
+        task_word = "task" if self._solver_task_count == 1 else "tasks"
         return (
-            "cuda-streams:%d (exact FP64; %d concurrent streams, "
-            "fused assembly/perturb/scatter; %d regular and %d batched "
-            "matrices; %.1f MiB static resident)" %
+            "cuda-streams:%d (exact FP64; %d concurrent %s, "
+            "%d independently scheduled solver %s; fused assembly/"
+            "perturb/scatter; %d regular and %d batched matrices; %.1f "
+            "MiB static resident)" %
             (
                 self._device.id,
                 self._stream_count,
+                stream_word,
+                self._solver_task_count,
+                task_word,
                 self._unbatched_matrices,
                 self._batched_matrices,
                 self._resident_bytes / (1024.0 * 1024.0),

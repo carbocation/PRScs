@@ -310,6 +310,27 @@ class CudaBetaBackendTests(unittest.TestCase):
         )
         self.assertAlmostEqual(actual_quad, expected_quad, places=10)
         self.assertIn("2 concurrent streams", streamed.describe())
+        self.assertIn(
+            "3 independently scheduled solver tasks", streamed.describe()
+        )
+
+    def test_stream_backend_keeps_dense_bucket_as_one_task(self):
+        blocks = [np.eye(2)] * 8
+        backend = CudaStreamsBetaBackend(
+            blocks,
+            [2] * len(blocks),
+            np.ones((2 * len(blocks), 1)),
+            1000,
+            seed=123,
+            cuda_bucket_size=1,
+            cuda_streams=4,
+        )
+
+        self.assertIn("1 concurrent stream", backend.describe())
+        self.assertIn(
+            "1 independently scheduled solver task", backend.describe()
+        )
+        self.assertIn("8 batched matrices", backend.describe())
 
     def test_stream_backend_is_seeded_reproducibly(self):
         blocks, sizes, beta_mrg, psi = _inputs()
