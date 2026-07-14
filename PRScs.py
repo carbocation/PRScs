@@ -15,7 +15,7 @@ python PRScs.py --ref_dir=PATH_TO_REFERENCE --bim_prefix=VALIDATION_BIM_PREFIX -
                  --backend=cpu|cuda|cuda-pcg --cuda_device=DEVICE --cuda_bucket_size=SIZE
                  --pcg_tol=TOL --pcg_maxiter=ITERATIONS --pcg_check_interval=ITERATIONS
                  --ld_diagnostics=TRUE|FALSE --ld_rank_tol=TOL
-                 --psi_backend=cpu|cuda|cuda-raw
+                 --psi_backend=cpu|cuda|cuda-raw|cuda-fused
                  --cuda_gig_max_rounds=ROUNDS
                  --profile=TRUE|FALSE]
 
@@ -137,8 +137,11 @@ def parse_param():
     elif not 0 <= param_dict['ld_rank_tol'] < 1:
         print('* --ld_rank_tol must be in [0, 1)\n')
         sys.exit(2)
-    elif param_dict['psi_backend'] not in ('cpu', 'cuda', 'cuda-raw'):
-        print('* --psi_backend must be cpu, cuda or cuda-raw\n')
+    elif param_dict['psi_backend'] not in (
+            'cpu', 'cuda', 'cuda-raw', 'cuda-fused'):
+        print(
+            '* --psi_backend must be cpu, cuda, cuda-raw or cuda-fused\n'
+        )
         sys.exit(2)
     elif param_dict['cuda_gig_max_rounds'] < 1:
         print('* --cuda_gig_max_rounds must be at least 1\n')

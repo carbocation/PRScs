@@ -31,7 +31,8 @@ def parse_args():
     parser.add_argument("--pcg-maxiter", type=int, default=100)
     parser.add_argument("--pcg-check-interval", type=int, default=4)
     parser.add_argument(
-        "--psi-backend", choices=("cpu", "cuda", "cuda-raw"),
+        "--psi-backend",
+        choices=("cpu", "cuda", "cuda-raw", "cuda-fused"),
         default="cpu"
     )
     parser.add_argument("--cuda-gig-max-rounds", type=int, default=1000)

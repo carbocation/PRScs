@@ -110,7 +110,7 @@ using GWAS summary statistics and an external LD reference panel.
 ## Using PRS-CS
 
 `
-python PRScs.py --ref_dir=PATH_TO_REFERENCE --bim_prefix=VALIDATION_BIM_PREFIX --sst_file=SUM_STATS_FILE --n_gwas=GWAS_SAMPLE_SIZE --out_dir=OUTPUT_DIR [--a=PARAM_A --b=PARAM_B --phi=PARAM_PHI --n_iter=MCMC_ITERATIONS --n_burnin=MCMC_BURNIN --thin=MCMC_THINNING_FACTOR --chrom=CHROM --beta_std=BETA_STD --write_psi=WRITE_PSI --write_pst=WRITE_POSTERIOR_SAMPLES --seed=SEED --backend=cpu|cuda|cuda-pcg --cuda_device=DEVICE --cuda_bucket_size=SIZE --pcg_tol=TOL --pcg_maxiter=ITERATIONS --pcg_check_interval=ITERATIONS --ld_diagnostics=TRUE|FALSE --ld_rank_tol=TOL --psi_backend=cpu|cuda|cuda-raw --cuda_gig_max_rounds=ROUNDS --profile=TRUE|FALSE]
+python PRScs.py --ref_dir=PATH_TO_REFERENCE --bim_prefix=VALIDATION_BIM_PREFIX --sst_file=SUM_STATS_FILE --n_gwas=GWAS_SAMPLE_SIZE --out_dir=OUTPUT_DIR [--a=PARAM_A --b=PARAM_B --phi=PARAM_PHI --n_iter=MCMC_ITERATIONS --n_burnin=MCMC_BURNIN --thin=MCMC_THINNING_FACTOR --chrom=CHROM --beta_std=BETA_STD --write_psi=WRITE_PSI --write_pst=WRITE_POSTERIOR_SAMPLES --seed=SEED --backend=cpu|cuda|cuda-pcg --cuda_device=DEVICE --cuda_bucket_size=SIZE --pcg_tol=TOL --pcg_maxiter=ITERATIONS --pcg_check_interval=ITERATIONS --ld_diagnostics=TRUE|FALSE --ld_rank_tol=TOL --psi_backend=cpu|cuda|cuda-raw|cuda-fused --cuda_gig_max_rounds=ROUNDS --profile=TRUE|FALSE]
 `
  - PATH_TO_REFERENCE (required): Full path (including folder name) to the directory that contains information on the LD reference panel (the snpinfo file and hdf5 files). If the 1000 Genomes reference panel is used, folder name would be `ldblk_1kg_afr`, `ldblk_1kg_amr`, `ldblk_1kg_eas`, `ldblk_1kg_eur` or `ldblk_1kg_sas`; if the UK Biobank reference panel is used, folder name would be `ldblk_ukbb_afr`, `ldblk_ukbb_amr`, `ldblk_ukbb_eas`, `ldblk_ukbb_eur` or `ldblk_ukbb_sas`. Note that the reference panel should match the ancestry of the GWAS sample (not the target sample).
 
@@ -257,6 +257,12 @@ python PRScs.py ... --chrom=22 --backend=cuda --psi_backend=cuda-raw --profile=T
 
 Both versions still transfer the beta and local-scale vectors once per iteration; they are intermediate steps toward keeping the complete MCMC state resident on the device.
 
+`--psi_backend=cuda-fused` additionally generates the gamma-distributed `delta` update inside the same kernel before drawing `psi`. This removes the remaining CPU-sized random-vector generation while retaining the same conditional update sequence:
+
+```
+python PRScs.py ... --chrom=22 --backend=cuda --psi_backend=cuda-fused --profile=True
+```
+
 The CPU and CUDA backends use different random-number generators, so seeded runs are reproducible within a fixed backend configuration but are not expected to produce identical draws across backends. Validate posterior summaries rather than individual samples. CuPy does not guarantee an identical random stream across major CuPy versions.
 
 GPU benefit depends strongly on the real LD block-size distribution and hardware FP64 throughput. Compare elapsed time for the same single chromosome after excluding the first iteration, which includes CUDA library initialization. The backend reports its number of size buckets and static resident GPU memory when the sampler starts; CUDA solver workspaces and the CuPy memory pool require additional memory. For PCG, also inspect the reported mean/max iteration count and maximum true residual. Cholesky remains the correctness and performance fallback when PCG needs too many iterations.
@@ -267,7 +273,7 @@ Run the self-contained 40,000-variant benchmark with:
 python3 benchmark_gpu.py
 ```
 
-The default comparison runs `cpu`, `cuda`, and `cuda-pcg`. Use, for example, `--backends=cuda,cuda-pcg --n-iter=100` for a longer GPU-only comparison. Add `--psi-backend=cuda` to benchmark the vectorized CUDA GIG update or `--psi-backend=cuda-raw` for the single-kernel implementation. The benchmark does not install or modify CUDA packages or drivers.
+The default comparison runs `cpu`, `cuda`, and `cuda-pcg`. Use, for example, `--backends=cuda,cuda-pcg --n-iter=100` for a longer GPU-only comparison. Add `--psi-backend=cuda` to benchmark the vectorized CUDA GIG update, `--psi-backend=cuda-raw` for the single-kernel GIG implementation, or `--psi-backend=cuda-fused` to include `delta` generation in that kernel. The benchmark does not install or modify CUDA packages or drivers.
 
 
 ## Test Data
