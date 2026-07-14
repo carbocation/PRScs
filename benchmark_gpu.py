@@ -17,8 +17,8 @@ from parse_genet import _project_ld_psd
 def parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "--backends", default="cpu,cuda,cuda-pcg",
-        help="comma-separated subset of cpu,cuda,cuda-pcg",
+        "--backends", default="cpu,cuda,cuda-direct,cuda-pcg",
+        help="comma-separated subset of cpu,cuda,cuda-direct,cuda-pcg",
     )
     parser.add_argument("--block-size", type=int, default=400)
     parser.add_argument("--n-blocks", type=int, default=100)
@@ -40,7 +40,7 @@ def parse_args():
 
 
 def validate_args(args):
-    allowed = {"cpu", "cuda", "cuda-pcg"}
+    allowed = {"cpu", "cuda", "cuda-direct", "cuda-pcg"}
     backends = [value.strip() for value in args.backends.split(",")]
     unknown = set(backends) - allowed
     if unknown:

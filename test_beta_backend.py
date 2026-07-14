@@ -14,6 +14,7 @@ from scipy import linalg
 from beta_backend import (
     CpuBetaBackend,
     CudaBetaBackend,
+    CudaDirectBetaBackend,
     CudaPcgBetaBackend,
     diagnose_ld_blocks,
     format_ld_diagnostics,
@@ -180,6 +181,48 @@ class CpuBetaBackendTests(unittest.TestCase):
 
 @unittest.skipUnless(_cuda_available(), "CuPy and a CUDA device are required")
 class CudaBetaBackendTests(unittest.TestCase):
+    def test_direct_backend_reports_cholesky_failure(self):
+        backend = CudaDirectBetaBackend(
+            [-2.0 * np.eye(2)],
+            [2],
+            np.ones((2, 1)),
+            1000,
+            seed=123,
+            cuda_bucket_size=1,
+        )
+        with self.assertRaisesRegex(
+                RuntimeError, "direct CUDA Cholesky failed"):
+            backend.sample(np.ones((2, 1)), 1.0)
+
+    def test_direct_backend_matches_generic_cuda_draw(self):
+        blocks, sizes, beta_mrg, psi = _inputs()
+        sigma = 0.7
+        generic = CudaBetaBackend(
+            blocks,
+            sizes,
+            beta_mrg,
+            1000,
+            seed=123,
+            cuda_bucket_size=4,
+        )
+        direct = CudaDirectBetaBackend(
+            blocks,
+            sizes,
+            beta_mrg,
+            1000,
+            seed=123,
+            cuda_bucket_size=4,
+        )
+
+        expected_beta, expected_quad = generic.sample(psi, sigma)
+        actual_beta, actual_quad = direct.sample(psi, sigma)
+
+        np.testing.assert_allclose(
+            actual_beta, expected_beta, rtol=1e-11, atol=1e-11
+        )
+        self.assertAlmostEqual(actual_quad, expected_quad, places=10)
+        self.assertIn("potrfBatched", direct.describe())
+
     def test_irregular_padded_blocks_have_correct_quadratic_form(self):
         blocks, sizes, beta_mrg, psi = _inputs()
         sigma = 0.7

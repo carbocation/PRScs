@@ -427,6 +427,165 @@ class CudaBetaBackend:
         )
 
 
+class CudaDirectBetaBackend(CudaBetaBackend):
+    """Preallocated direct cuSOLVER/cuBLAS FP64 batched implementation."""
+
+    name = "cuda-direct"
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        try:
+            from cupy.cuda import cublas, device
+            from cupy_backends.cuda.libs import cusolver
+        except ImportError as exc:
+            raise RuntimeError(
+                "The direct CUDA beta backend requires CuPy's cuBLAS and "
+                "cuSOLVER bindings"
+            ) from exc
+
+        cp = self._cp
+        self._cublas = cublas
+        self._cusolver = cusolver
+        self._one = np.array(1.0, dtype=np.float64)
+        self._potrf_checked = False
+
+        def matrix_pointers(array):
+            count = array.shape[0]
+            step = int(array[0].nbytes)
+            start = int(array.data.ptr)
+            return cp.arange(
+                start,
+                start + step * count,
+                step,
+                dtype=cp.uintp,
+            )
+
+        with self._device:
+            self._cublas_handle = device.get_cublas_handle()
+            self._cusolver_handle = device.get_cusolver_handle()
+            for group in self._groups:
+                precision = group["ld"].copy()
+                rhs = cp.empty_like(group["beta_mrg"])
+                direct_arrays = {
+                    "precision": precision,
+                    "rhs": rhs,
+                    "precision_ptrs": matrix_pointers(precision),
+                    "rhs_ptrs": matrix_pointers(rhs),
+                    "potrf_info": cp.empty(
+                        precision.shape[0], dtype=cp.int32
+                    ),
+                }
+                group.update(direct_arrays)
+                self._resident_bytes += sum(
+                    int(value.nbytes) for value in direct_arrays.values()
+                )
+
+    def _triangular_solve(self, group, trans):
+        size = group["precision"].shape[-1]
+        count = group["precision"].shape[0]
+        self._cublas.dtrsmBatched(
+            self._cublas_handle,
+            self._cublas.CUBLAS_SIDE_LEFT,
+            self._cublas.CUBLAS_FILL_MODE_UPPER,
+            trans,
+            self._cublas.CUBLAS_DIAG_NON_UNIT,
+            size,
+            1,
+            self._one.ctypes.data,
+            group["precision_ptrs"].data.ptr,
+            size,
+            group["rhs_ptrs"].data.ptr,
+            size,
+            count,
+        )
+
+    def sample(self, psi, sigma):
+        """Draw beta with fixed device workspaces and in-place CUDA calls."""
+        cp = self._cp
+        psi = np.asarray(psi, dtype=np.float64).reshape(-1)
+        if psi.size != self._p:
+            raise ValueError("psi and beta_mrg must have the same length")
+
+        with self._device:
+            self._psi_device.set(psi)
+            quad = cp.zeros((), dtype=cp.float64)
+            sd = float(np.sqrt(float(sigma) / self._n_gwas))
+            noise = self._rng.standard_normal(self._p, dtype=cp.float64)
+
+            for group_index, group in enumerate(self._groups):
+                precision = group["precision"]
+                cp.copyto(precision, group["ld"])
+                safe_indices = group["indices"]
+                inv_psi = cp.where(
+                    group["valid"],
+                    1.0 / self._psi_device[safe_indices],
+                    0.0,
+                )
+                diag = group["diag"]
+                precision[:, diag, diag] += inv_psi
+
+                size = precision.shape[-1]
+                count = precision.shape[0]
+                self._cusolver.dpotrfBatched(
+                    self._cusolver_handle,
+                    self._cublas.CUBLAS_FILL_MODE_UPPER,
+                    size,
+                    group["precision_ptrs"].data.ptr,
+                    size,
+                    group["potrf_info"].data.ptr,
+                    count,
+                )
+                if not self._potrf_checked:
+                    info = cp.asnumpy(group["potrf_info"])
+                    failures = np.flatnonzero(info)
+                    if failures.size:
+                        first = int(failures[0])
+                        raise RuntimeError(
+                            "direct CUDA Cholesky failed in size bucket %d, "
+                            "matrix %d with info=%d" %
+                            (group_index, first, int(info[first]))
+                        )
+
+                rhs = group["rhs"]
+                cp.copyto(rhs, group["beta_mrg"])
+                # Row-major L is seen by cuBLAS as column-major U=L.T.
+                # U.T y=b therefore performs the first solve L y=b.
+                self._triangular_solve(
+                    group, self._cublas.CUBLAS_OP_T
+                )
+                rhs += (
+                    sd * noise[group["indices"]][..., None] *
+                    group["valid"][..., None]
+                )
+                quad += cp.sum(rhs * rhs)
+
+                # U beta=y is the second solve L.T beta=y.
+                self._triangular_solve(
+                    group, self._cublas.CUBLAS_OP_N
+                )
+                flat_valid = group["valid"].ravel()
+                self._beta_result[
+                    group["indices"].ravel()[flat_valid]
+                ] = rhs[..., 0].ravel()[flat_valid]
+
+            self._potrf_checked = True
+            self._beta_result[self._p] = quad
+            result = cp.asnumpy(self._beta_result)
+
+        return result[:self._p].reshape(-1, 1), float(result[self._p])
+
+    def describe(self):
+        return (
+            "cuda-direct:%d (preallocated FP64 potrfBatched + "
+            "trsmBatched; %d size buckets; %.1f MiB static resident)" %
+            (
+                self._device.id,
+                len(self._groups),
+                self._resident_bytes / (1024.0 * 1024.0),
+            )
+        )
+
+
 class CudaPcgBetaBackend:
     """FP64 perturb-and-solve sampler using batched CUDA PCG solves."""
 
@@ -835,9 +994,11 @@ def make_beta_backend(backend, ld_blocks, block_sizes, beta_mrg, n_gwas,
         return CpuBetaBackend(**kwargs)
     if backend == "cuda":
         return CudaBetaBackend(**kwargs)
+    if backend == "cuda-direct":
+        return CudaDirectBetaBackend(**kwargs)
     if backend == "cuda-pcg":
         return CudaPcgBetaBackend(**kwargs)
     raise ValueError(
-        "unknown beta backend %r; expected 'cpu', 'cuda' or 'cuda-pcg'" %
-        backend
+        "unknown beta backend %r; expected 'cpu', 'cuda', 'cuda-direct' "
+        "or 'cuda-pcg'" % backend
     )
