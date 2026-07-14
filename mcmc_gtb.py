@@ -16,6 +16,7 @@ from psi_backend import make_psi_backend
 
 def mcmc(a, b, phi, sst_dict, n, ld_blk, blk_size, n_iter, n_burnin, thin, chrom, out_dir, beta_std, write_psi, write_pst, seed,
          backend='cpu', cuda_device=0, cuda_bucket_size=32, profile='FALSE',
+         cuda_streams=4,
          pcg_tol=1e-10, pcg_maxiter=100, pcg_check_interval=4,
          ld_rank_tol=1e-8, ld_factors=None, ld_eigenvalues=None,
          psi_backend='cpu', cuda_gig_max_rounds=1000):
@@ -55,6 +56,7 @@ def mcmc(a, b, phi, sst_dict, n, ld_blk, blk_size, n_iter, n_burnin, thin, chrom
         seed=seed,
         cuda_device=cuda_device,
         cuda_bucket_size=cuda_bucket_size,
+        cuda_streams=cuda_streams,
         pcg_tol=pcg_tol,
         pcg_maxiter=pcg_maxiter,
         pcg_check_interval=pcg_check_interval,

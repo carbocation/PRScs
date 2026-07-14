@@ -20,7 +20,7 @@ def parse_args():
         "--backends", default="cpu,cuda,cuda-direct,cuda-pcg",
         help=(
             "comma-separated subset of cpu,cuda,cuda-direct,cuda-hybrid,"
-            "cuda-fp32,cuda-pcg"
+            "cuda-streams,cuda-fp32,cuda-pcg"
         ),
     )
     parser.add_argument("--block-size", type=int, default=400)
@@ -30,6 +30,7 @@ def parse_args():
     parser.add_argument("--thin", type=int, default=2)
     parser.add_argument("--cuda-device", type=int, default=0)
     parser.add_argument("--cuda-bucket-size", type=int, default=32)
+    parser.add_argument("--cuda-streams", type=int, default=4)
     parser.add_argument("--pcg-tol", type=float, default=1e-10)
     parser.add_argument("--pcg-maxiter", type=int, default=100)
     parser.add_argument("--pcg-check-interval", type=int, default=4)
@@ -44,8 +45,8 @@ def parse_args():
 
 def validate_args(args):
     allowed = {
-        "cpu", "cuda", "cuda-direct", "cuda-hybrid", "cuda-fp32",
-        "cuda-pcg",
+        "cpu", "cuda", "cuda-direct", "cuda-hybrid", "cuda-streams",
+        "cuda-fp32", "cuda-pcg",
     }
     backends = [value.strip() for value in args.backends.split(",")]
     unknown = set(backends) - allowed
@@ -57,6 +58,8 @@ def validate_args(args):
         raise ValueError("n-burnin must be in [0, n-iter)")
     if args.thin < 1:
         raise ValueError("thin must be positive")
+    if args.cuda_streams < 1:
+        raise ValueError("cuda-streams must be positive")
     return backends
 
 
@@ -129,6 +132,7 @@ def main():
                 backend=backend,
                 cuda_device=args.cuda_device,
                 cuda_bucket_size=args.cuda_bucket_size,
+                cuda_streams=args.cuda_streams,
                 profile="TRUE",
                 pcg_tol=args.pcg_tol,
                 pcg_maxiter=args.pcg_maxiter,

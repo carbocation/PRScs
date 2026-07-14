@@ -12,7 +12,7 @@ Usage:
 python PRScs.py --ref_dir=PATH_TO_REFERENCE --bim_prefix=VALIDATION_BIM_PREFIX --sst_file=SUM_STATS_FILE --n_gwas=GWAS_SAMPLE_SIZE --out_dir=OUTPUT_DIR
                 [--a=PARAM_A --b=PARAM_B --phi=PARAM_PHI --n_iter=MCMC_ITERATIONS --n_burnin=MCMC_BURNIN --thin=MCMC_THINNING_FACTOR
                  --chrom=CHROM --write_psi=WRITE_PSI --write_pst=WRITE_POSTERIOR_SAMPLES --seed=SEED
-                 --backend=cpu|cuda|cuda-direct|cuda-hybrid|cuda-fp32|cuda-pcg --cuda_device=DEVICE --cuda_bucket_size=SIZE
+                 --backend=cpu|cuda|cuda-direct|cuda-hybrid|cuda-streams|cuda-fp32|cuda-pcg --cuda_device=DEVICE --cuda_bucket_size=SIZE --cuda_streams=STREAMS
                  --pcg_tol=TOL --pcg_maxiter=ITERATIONS --pcg_check_interval=ITERATIONS
                  --ld_diagnostics=TRUE|FALSE --ld_rank_tol=TOL
                  --psi_backend=cpu|cuda|cuda-raw|cuda-fused
@@ -35,7 +35,8 @@ def parse_param():
                       'n_iter=', 'n_burnin=', 'thin=', 'out_dir=', 'chrom=', 'beta_std=', 'write_psi=', 'write_pst=', 'seed=', 'help']
 
     long_opts_list += [
-        'backend=', 'cuda_device=', 'cuda_bucket_size=', 'profile=',
+        'backend=', 'cuda_device=', 'cuda_bucket_size=', 'cuda_streams=',
+        'profile=',
         'pcg_tol=', 'pcg_maxiter=', 'pcg_check_interval=',
         'ld_diagnostics=', 'ld_rank_tol=', 'psi_backend=',
         'cuda_gig_max_rounds=',
@@ -44,7 +45,8 @@ def parse_param():
     param_dict = {'ref_dir': None, 'bim_prefix': None, 'sst_file': None, 'a': 1, 'b': 0.5, 'phi': None, 'n_gwas': None,
                   'n_iter': 1000, 'n_burnin': 500, 'thin': 5, 'out_dir': None, 'chrom': range(1,23),
                   'beta_std': 'FALSE', 'write_psi': 'FALSE', 'write_pst': 'FALSE', 'seed': None,
-                  'backend': 'cpu', 'cuda_device': 0, 'cuda_bucket_size': 32, 'profile': 'FALSE',
+                  'backend': 'cpu', 'cuda_device': 0, 'cuda_bucket_size': 32,
+                  'cuda_streams': 4, 'profile': 'FALSE',
                   'pcg_tol': 1e-10, 'pcg_maxiter': 100,
                   'pcg_check_interval': 4, 'ld_diagnostics': 'FALSE',
                   'ld_rank_tol': 1e-8, 'psi_backend': 'cpu',
@@ -83,6 +85,7 @@ def parse_param():
             elif opt == "--backend": param_dict['backend'] = arg.lower()
             elif opt == "--cuda_device": param_dict['cuda_device'] = int(arg)
             elif opt == "--cuda_bucket_size": param_dict['cuda_bucket_size'] = int(arg)
+            elif opt == "--cuda_streams": param_dict['cuda_streams'] = int(arg)
             elif opt == "--profile": param_dict['profile'] = arg.upper()
             elif opt == "--pcg_tol": param_dict['pcg_tol'] = float(arg)
             elif opt == "--pcg_maxiter": param_dict['pcg_maxiter'] = int(arg)
@@ -111,16 +114,19 @@ def parse_param():
         print('* Please specify the output directory using --out_dir\n')
         sys.exit(2)
     elif param_dict['backend'] not in (
-            'cpu', 'cuda', 'cuda-direct', 'cuda-hybrid', 'cuda-fp32',
-            'cuda-pcg'):
+            'cpu', 'cuda', 'cuda-direct', 'cuda-hybrid', 'cuda-streams',
+            'cuda-fp32', 'cuda-pcg'):
         print('* --backend must be cpu, cuda, cuda-direct, '
-              'cuda-hybrid, cuda-fp32 or cuda-pcg\n')
+              'cuda-hybrid, cuda-streams, cuda-fp32 or cuda-pcg\n')
         sys.exit(2)
     elif param_dict['cuda_device'] < 0:
         print('* --cuda_device must be non-negative\n')
         sys.exit(2)
     elif param_dict['cuda_bucket_size'] < 1:
         print('* --cuda_bucket_size must be at least 1\n')
+        sys.exit(2)
+    elif param_dict['cuda_streams'] < 1:
+        print('* --cuda_streams must be at least 1\n')
         sys.exit(2)
     elif param_dict['profile'] not in ('TRUE', 'FALSE'):
         print('* --profile must be True or False\n')
@@ -205,6 +211,7 @@ def main():
             param_dict['seed'], backend=param_dict['backend'],
             cuda_device=param_dict['cuda_device'],
             cuda_bucket_size=param_dict['cuda_bucket_size'],
+            cuda_streams=param_dict['cuda_streams'],
             profile=param_dict['profile'], pcg_tol=param_dict['pcg_tol'],
             pcg_maxiter=param_dict['pcg_maxiter'],
             pcg_check_interval=param_dict['pcg_check_interval'],

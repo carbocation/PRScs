@@ -18,6 +18,7 @@ from beta_backend import (
     CudaFp32BetaBackend,
     CudaHybridBetaBackend,
     CudaPcgBetaBackend,
+    CudaStreamsBetaBackend,
     diagnose_ld_blocks,
     format_ld_diagnostics,
     ld_layout_diagnostics,
@@ -278,6 +279,71 @@ class CudaBetaBackendTests(unittest.TestCase):
         )
         with self.assertRaisesRegex(
                 RuntimeError, "hybrid CUDA Cholesky failed"):
+            backend.sample(np.ones((2, 1)), 1.0)
+
+    def test_stream_backend_matches_hybrid_cuda_draw(self):
+        blocks, sizes, beta_mrg, psi = _inputs()
+        sigma = 0.7
+        hybrid = CudaHybridBetaBackend(
+            blocks,
+            sizes,
+            beta_mrg,
+            1000,
+            seed=123,
+            cuda_bucket_size=4,
+        )
+        streamed = CudaStreamsBetaBackend(
+            blocks,
+            sizes,
+            beta_mrg,
+            1000,
+            seed=123,
+            cuda_bucket_size=4,
+            cuda_streams=2,
+        )
+
+        expected_beta, expected_quad = hybrid.sample(psi, sigma)
+        actual_beta, actual_quad = streamed.sample(psi, sigma)
+
+        np.testing.assert_allclose(
+            actual_beta, expected_beta, rtol=1e-10, atol=1e-10
+        )
+        self.assertAlmostEqual(actual_quad, expected_quad, places=10)
+        self.assertIn("2 concurrent streams", streamed.describe())
+
+    def test_stream_backend_is_seeded_reproducibly(self):
+        blocks, sizes, beta_mrg, psi = _inputs()
+        backends = [
+            CudaStreamsBetaBackend(
+                blocks,
+                sizes,
+                beta_mrg,
+                1000,
+                seed=987,
+                cuda_bucket_size=4,
+                cuda_streams=2,
+            )
+            for _ in range(2)
+        ]
+
+        first_beta, first_quad = backends[0].sample(psi, 0.7)
+        second_beta, second_quad = backends[1].sample(psi, 0.7)
+
+        np.testing.assert_array_equal(first_beta, second_beta)
+        self.assertEqual(first_quad, second_quad)
+
+    def test_stream_backend_reports_cholesky_failure(self):
+        backend = CudaStreamsBetaBackend(
+            [-2.0 * np.eye(2)],
+            [2],
+            np.ones((2, 1)),
+            1000,
+            seed=123,
+            cuda_bucket_size=1,
+            cuda_streams=2,
+        )
+        with self.assertRaisesRegex(
+                RuntimeError, "streamed CUDA Cholesky failed"):
             backend.sample(np.ones((2, 1)), 1.0)
 
     def test_fp32_backend_tracks_analytic_conditional_mean(self):
