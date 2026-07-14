@@ -15,6 +15,7 @@ from beta_backend import (
     CpuBetaBackend,
     CudaBetaBackend,
     CudaDirectBetaBackend,
+    CudaFusedSolveBetaBackend,
     CudaPcgBetaBackend,
     diagnose_ld_blocks,
     format_ld_diagnostics,
@@ -222,6 +223,35 @@ class CudaBetaBackendTests(unittest.TestCase):
         )
         self.assertAlmostEqual(actual_quad, expected_quad, places=10)
         self.assertIn("potrfBatched", direct.describe())
+
+    def test_fused_solve_backend_matches_direct_cuda_draw(self):
+        blocks, sizes, beta_mrg, psi = _inputs()
+        sigma = 0.7
+        direct = CudaDirectBetaBackend(
+            blocks,
+            sizes,
+            beta_mrg,
+            1000,
+            seed=123,
+            cuda_bucket_size=4,
+        )
+        fused = CudaFusedSolveBetaBackend(
+            blocks,
+            sizes,
+            beta_mrg,
+            1000,
+            seed=123,
+            cuda_bucket_size=4,
+        )
+
+        expected_beta, expected_quad = direct.sample(psi, sigma)
+        actual_beta, actual_quad = fused.sample(psi, sigma)
+
+        np.testing.assert_allclose(
+            actual_beta, expected_beta, rtol=1e-10, atol=1e-10
+        )
+        self.assertAlmostEqual(actual_quad, expected_quad, places=9)
+        self.assertIn("fused one-RHS", fused.describe())
 
     def test_irregular_padded_blocks_have_correct_quadratic_form(self):
         blocks, sizes, beta_mrg, psi = _inputs()

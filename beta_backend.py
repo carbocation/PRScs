@@ -657,6 +657,286 @@ class CudaDirectBetaBackend(CudaBetaBackend):
         )
 
 
+_CUDA_FUSED_SOLVE_SOURCE = r"""
+extern "C" {
+
+__device__ __forceinline__ double block_sum(
+        double value, double* warp_sums) {
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        value += __shfl_down_sync(0xffffffff, value, offset);
+    }
+    if (lane == 0) {
+        warp_sums[warp] = value;
+    }
+    __syncthreads();
+
+    if (threadIdx.x == 0) {
+        value = 0.0;
+        const int warps = (blockDim.x + 31) >> 5;
+        for (int index = 0; index < warps; ++index) {
+            value += warp_sums[index];
+        }
+    } else {
+        value = 0.0;
+    }
+    return value;
+}
+
+__global__ void fused_batched_solve(
+        double* factors,
+        const double* beta_mrg,
+        const long long* indices,
+        const int* sizes,
+        const double* noise,
+        const double sd,
+        const int padded_size,
+        double* rhs,
+        double* beta_result,
+        double* quad) {
+    const int batch = blockIdx.x;
+    const int tid = threadIdx.x;
+    const int size = sizes[batch];
+    const long long matrix_base =
+        (long long)batch * padded_size * padded_size;
+    const long long vector_base = (long long)batch * padded_size;
+    double* matrix = factors + matrix_base;
+    double* vector = rhs + vector_base;
+    const double* marginal = beta_mrg + vector_base;
+    const long long* variant = indices + vector_base;
+    __shared__ double warp_sums[8];
+
+    // cuSOLVER sees column-major U; row-major code sees its transpose L.
+    // Copy L.T into the otherwise disposable upper triangle so both solve
+    // directions use contiguous matrix rows.
+    const long long active_entries = (long long)size * size;
+    for (long long entry = tid; entry < active_entries;
+            entry += blockDim.x) {
+        const int row = entry / size;
+        const int column = entry - (long long)row * size;
+        if (column > row) {
+            matrix[(long long)row * padded_size + column] =
+                matrix[(long long)column * padded_size + row];
+        }
+    }
+    for (int row = tid; row < size; row += blockDim.x) {
+        vector[row] = marginal[row];
+    }
+    __syncthreads();
+
+    // Forward solve L y = beta_mrg.
+    for (int row = 0; row < size; ++row) {
+        double partial = 0.0;
+        const long long row_base = (long long)row * padded_size;
+        for (int column = tid; column < row; column += blockDim.x) {
+            partial += matrix[row_base + column] * vector[column];
+        }
+        const double total = block_sum(partial, warp_sums);
+        if (tid == 0) {
+            vector[row] = (
+                vector[row] - total
+            ) / matrix[row_base + row];
+        }
+        __syncthreads();
+    }
+
+    // Add the Gaussian perturbation and accumulate ||y||^2.
+    double local_quad = 0.0;
+    for (int row = tid; row < size; row += blockDim.x) {
+        const double value = vector[row] + sd * noise[variant[row]];
+        vector[row] = value;
+        local_quad += value * value;
+    }
+    const double matrix_quad = block_sum(local_quad, warp_sums);
+    if (tid == 0) {
+        atomicAdd(quad, matrix_quad);
+    }
+    __syncthreads();
+
+    // Backward solve L.T beta = y, using the transposed upper triangle.
+    for (int row = size - 1; row >= 0; --row) {
+        double partial = 0.0;
+        const long long row_base = (long long)row * padded_size;
+        for (int column = row + 1 + tid; column < size;
+                column += blockDim.x) {
+            partial += matrix[row_base + column] * vector[column];
+        }
+        const double total = block_sum(partial, warp_sums);
+        if (tid == 0) {
+            vector[row] = (
+                vector[row] - total
+            ) / matrix[row_base + row];
+        }
+        __syncthreads();
+    }
+
+    for (int row = tid; row < size; row += blockDim.x) {
+        beta_result[variant[row]] = vector[row];
+    }
+}
+
+}
+"""
+
+
+class CudaFusedSolveBetaBackend(CudaDirectBetaBackend):
+    """Direct FP64 Cholesky with one fused batched vector-solve kernel."""
+
+    name = "cuda-fused-solve"
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        cp = self._cp
+        with self._device:
+            self._fused_solve_kernel = cp.RawKernel(
+                _CUDA_FUSED_SOLVE_SOURCE,
+                "fused_batched_solve",
+                options=("-std=c++11",),
+            )
+            for group in self._groups:
+                sizes = cp.sum(
+                    group["valid"], axis=1, dtype=cp.int32
+                )
+                group["fused_sizes"] = sizes
+                self._resident_bytes += int(sizes.nbytes)
+        self._fused_profile_calls = 0
+        self._fused_profile_host_total = 0.0
+        self._fused_profile_stage_totals = np.zeros(4)
+
+    def sample(self, psi, sigma):
+        """Draw beta using direct Cholesky and a fused FP64 solve kernel."""
+        cp = self._cp
+        profile_started = (
+            time.perf_counter() if self._direct_profile_enabled else None
+        )
+        psi = np.asarray(psi, dtype=np.float64).reshape(-1)
+        if psi.size != self._p:
+            raise ValueError("psi and beta_mrg must have the same length")
+
+        with self._device:
+            if self._direct_profile_enabled:
+                self._direct_profile_preamble[0].record()
+            self._psi_device.set(psi)
+            quad = cp.zeros((), dtype=cp.float64)
+            sd = float(np.sqrt(float(sigma) / self._n_gwas))
+            noise = self._rng.standard_normal(self._p, dtype=cp.float64)
+            if self._direct_profile_enabled:
+                self._direct_profile_preamble[1].record()
+
+            for group_index, group in enumerate(self._groups):
+                events = group.get("direct_profile_events")
+                if events is not None:
+                    events[0].record()
+                precision = group["precision"]
+                cp.copyto(precision, group["ld"])
+                safe_indices = group["indices"]
+                inv_psi = cp.where(
+                    group["valid"],
+                    1.0 / self._psi_device[safe_indices],
+                    0.0,
+                )
+                diag = group["diag"]
+                precision[:, diag, diag] += inv_psi
+                if events is not None:
+                    events[1].record()
+
+                size = precision.shape[-1]
+                count = precision.shape[0]
+                self._cusolver.dpotrfBatched(
+                    self._cusolver_handle,
+                    self._cublas.CUBLAS_FILL_MODE_UPPER,
+                    size,
+                    group["precision_ptrs"].data.ptr,
+                    size,
+                    group["potrf_info"].data.ptr,
+                    count,
+                )
+                if events is not None:
+                    events[2].record()
+                if not self._potrf_checked:
+                    info = cp.asnumpy(group["potrf_info"])
+                    failures = np.flatnonzero(info)
+                    if failures.size:
+                        first = int(failures[0])
+                        raise RuntimeError(
+                            "fused-solve CUDA Cholesky failed in size "
+                            "bucket %d, matrix %d with info=%d" %
+                            (group_index, first, int(info[first]))
+                        )
+
+                self._fused_solve_kernel(
+                    (count,),
+                    (256,),
+                    (
+                        precision,
+                        group["beta_mrg"],
+                        group["indices"],
+                        group["fused_sizes"],
+                        noise,
+                        np.float64(sd),
+                        np.int32(size),
+                        group["rhs"],
+                        self._beta_result,
+                        quad,
+                    ),
+                )
+                if events is not None:
+                    events[3].record()
+
+            self._potrf_checked = True
+            self._beta_result[self._p] = quad
+            result = cp.asnumpy(self._beta_result)
+
+            if self._direct_profile_enabled:
+                stages = np.zeros(4)
+                stages[0] = cp.cuda.get_elapsed_time(
+                    *self._direct_profile_preamble
+                ) / 1000.0
+                for group in self._groups:
+                    events = group["direct_profile_events"]
+                    for stage in range(1, 4):
+                        stages[stage] += cp.cuda.get_elapsed_time(
+                            events[stage - 1], events[stage]
+                        ) / 1000.0
+                if self._fused_profile_calls:
+                    self._fused_profile_stage_totals += stages
+                    self._fused_profile_host_total += (
+                        time.perf_counter() - profile_started
+                    )
+                self._fused_profile_calls += 1
+
+        return result[:self._p].reshape(-1, 1), float(result[self._p])
+
+    def describe(self):
+        return (
+            "cuda-fused-solve:%d (FP64 potrfBatched + fused one-RHS "
+            "solve/perturb/scatter; %d size buckets; %.1f MiB static "
+            "resident)" %
+            (
+                self._device.id,
+                len(self._groups),
+                self._resident_bytes / (1024.0 * 1024.0),
+            )
+        )
+
+    def profile_summary(self):
+        measured = self._fused_profile_calls - 1
+        if not self._direct_profile_enabled:
+            return "CUDA fused-solve stage profiling disabled"
+        if measured < 1:
+            return "CUDA fused-solve stages: no steady-state draws recorded"
+        means = 1000.0 * self._fused_profile_stage_totals / measured
+        host_mean = 1000.0 * self._fused_profile_host_total / measured
+        unattributed = max(host_mean - float(means.sum()), 0.0)
+        return (
+            "CUDA fused-solve stages (mean): preamble %.3f ms, "
+            "precision %.3f ms, potrf %.3f ms, fused solve %.3f ms, "
+            "host/unattributed %.3f ms" %
+            (*means, unattributed)
+        )
+
+
 class CudaPcgBetaBackend:
     """FP64 perturb-and-solve sampler using batched CUDA PCG solves."""
 
@@ -1068,9 +1348,11 @@ def make_beta_backend(backend, ld_blocks, block_sizes, beta_mrg, n_gwas,
         return CudaBetaBackend(**kwargs)
     if backend == "cuda-direct":
         return CudaDirectBetaBackend(**kwargs)
+    if backend == "cuda-fused-solve":
+        return CudaFusedSolveBetaBackend(**kwargs)
     if backend == "cuda-pcg":
         return CudaPcgBetaBackend(**kwargs)
     raise ValueError(
-        "unknown beta backend %r; expected 'cpu', 'cuda', 'cuda-direct' "
-        "or 'cuda-pcg'" % backend
+        "unknown beta backend %r; expected 'cpu', 'cuda', 'cuda-direct', "
+        "'cuda-fused-solve' or 'cuda-pcg'" % backend
     )
