@@ -249,7 +249,7 @@ Real LD panels can have only one or two blocks in most padded-size buckets. `cud
 python PRScs.py ... --chrom=22 --backend=cuda-hybrid --psi_backend=cuda-fused --profile=True
 ```
 
-`cuda-streams` preserves the same FP64 transition while assigning independent buckets to separate non-blocking CUDA streams, each with its own cuSOLVER handle, cuBLAS handle and factorization workspace. Fused FP64 kernels assemble each precision matrix and scatter solved coefficients without CuPy's intermediate indexing arrays. This is intended for real panels containing many large sparse buckets that do not individually saturate the GPU:
+`cuda-streams` preserves the same FP64 transition while assigning independent buckets to separate non-blocking CUDA streams, each with its own cuSOLVER handle, cuBLAS handle and factorization workspace. Fused FP64 kernels assemble each precision matrix, add the Gaussian perturbation with a deterministic per-block quadratic-form reduction, and scatter solved coefficients without CuPy's intermediate indexing arrays. This is intended for real panels containing many large sparse buckets that do not individually saturate the GPU:
 
 ```
 python PRScs.py ... --chrom=22 --backend=cuda-streams --cuda_streams=4 --psi_backend=cuda-fused --profile=True

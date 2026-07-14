@@ -57,6 +57,44 @@ void assemble_precision(
 }
 
 extern "C" __global__
+void perturb_quad(
+        double* rhs,
+        const long long* indices,
+        const unsigned char* valid,
+        const double* noise,
+        const double sd,
+        double* quad,
+        const int size) {
+    extern __shared__ double partial[];
+    const int matrix = blockIdx.x;
+    const unsigned long long base =
+        (unsigned long long)matrix * (unsigned long long)size;
+    double sum = 0.0;
+
+    for (int row = threadIdx.x; row < size; row += blockDim.x) {
+        const unsigned long long offset = base + (unsigned long long)row;
+        double value = rhs[offset];
+        if (valid[offset]) {
+            value += sd * noise[indices[offset]];
+        }
+        rhs[offset] = value;
+        sum += value * value;
+    }
+
+    partial[threadIdx.x] = sum;
+    __syncthreads();
+    for (int stride = blockDim.x / 2; stride > 0; stride /= 2) {
+        if (threadIdx.x < stride) {
+            partial[threadIdx.x] += partial[threadIdx.x + stride];
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) {
+        quad[matrix] = partial[0];
+    }
+}
+
+extern "C" __global__
 void scatter_beta(
         const double* rhs,
         const long long* indices,
@@ -1029,6 +1067,9 @@ class CudaStreamsBetaBackend(CudaHybridBetaBackend):
                 self._scatter_beta_kernel = (
                     self._stream_kernel_module.get_function("scatter_beta")
                 )
+                self._perturb_quad_kernel = (
+                    self._stream_kernel_module.get_function("perturb_quad")
+                )
                 self._kernel_threads = 256
                 self._streams = [
                     cp.cuda.Stream(non_blocking=True)
@@ -1057,14 +1098,21 @@ class CudaStreamsBetaBackend(CudaHybridBetaBackend):
                     self._lane_workspaces.append(workspace)
                     self._resident_bytes += int(workspace.nbytes)
 
-                self._quad_groups = cp.empty(
-                    len(self._groups), dtype=self._cuda_dtype
+                matrix_count = sum(
+                    int(group["precision"].shape[0])
+                    for group in self._groups
                 )
-                for group_index, group in enumerate(self._groups):
-                    group["quad_result"] = self._quad_groups[
-                        group_index:group_index + 1
-                    ].reshape(())
-                self._resident_bytes += int(self._quad_groups.nbytes)
+                self._quad_matrices = cp.empty(
+                    matrix_count, dtype=self._cuda_dtype
+                )
+                matrix_start = 0
+                for group in self._groups:
+                    count = int(group["precision"].shape[0])
+                    group["quad_results"] = self._quad_matrices[
+                        matrix_start:matrix_start + count
+                    ]
+                    matrix_start += count
+                self._resident_bytes += int(self._quad_matrices.nbytes)
 
                 self._stream_boundaries = [
                     cp.cuda.Event() for _ in range(6)
@@ -1182,12 +1230,22 @@ class CudaStreamsBetaBackend(CudaHybridBetaBackend):
             self._dispatch_stage(2, solve_first)
 
             def perturb(_lane, group):
-                rhs = group["rhs"]
-                rhs += (
-                    sd * noise[group["indices"]][..., None] *
-                    group["valid"][..., None]
+                self._perturb_quad_kernel(
+                    (int(group["precision"].shape[0]),),
+                    (self._kernel_threads,),
+                    (
+                        group["rhs"],
+                        group["indices"],
+                        group["valid"],
+                        noise,
+                        np.float64(sd),
+                        group["quad_results"],
+                        np.int32(group["precision"].shape[-1]),
+                    ),
+                    shared_mem=(
+                        self._kernel_threads * np.dtype(np.float64).itemsize
+                    ),
                 )
-                group["quad_result"][...] = cp.sum(rhs * rhs)
 
             self._dispatch_stage(3, perturb)
 
@@ -1217,7 +1275,7 @@ class CudaStreamsBetaBackend(CudaHybridBetaBackend):
             self._dispatch_stage(4, solve_second)
 
             self._potrf_checked = True
-            self._beta_result[self._p] = cp.sum(self._quad_groups)
+            self._beta_result[self._p] = cp.sum(self._quad_matrices)
             result = cp.asnumpy(self._beta_result)
 
             if self._direct_profile_enabled:
@@ -1242,8 +1300,8 @@ class CudaStreamsBetaBackend(CudaHybridBetaBackend):
     def describe(self):
         return (
             "cuda-streams:%d (exact FP64; %d concurrent streams, "
-            "fused assembly/scatter; %d regular and %d batched matrices; "
-            "%.1f MiB static resident)" %
+            "fused assembly/perturb/scatter; %d regular and %d batched "
+            "matrices; %.1f MiB static resident)" %
             (
                 self._device.id,
                 self._stream_count,
