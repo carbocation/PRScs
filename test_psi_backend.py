@@ -221,6 +221,14 @@ class CudaFusedPsiBackendTests(unittest.TestCase):
         self.assertLess(
             abs(delta_sum - expected_delta_sum), 5.0 * delta_sum_sd
         )
+        delta_draws = backend._cp.asnumpy(backend._delta)
+        expected_delta_variance = gamma_shape * delta_scale**2
+        self.assertTrue((delta_draws > 0.0).all())
+        self.assertLess(
+            abs(float(delta_draws.var()) - expected_delta_variance) /
+            expected_delta_variance,
+            0.03,
+        )
 
         np.random.seed(789)
         gigrnd.seed_rng(789)
@@ -237,17 +245,28 @@ class CudaFusedPsiBackendTests(unittest.TestCase):
             n,
         )
 
+        # At the default gamma shape of 1.5, mixing over delta gives the
+        # untruncated positive-shape GIG draw an infinite second moment.
+        # The sampler immediately caps psi at 1, so compare that actual,
+        # bounded transition rather than unstable pre-cap sample variances.
+        actual_clipped = np.minimum(actual, 1.0)
+        reference_clipped = np.minimum(reference, 1.0)
         combined_mean_se = np.sqrt(
-            (actual.var() + reference.var()) / size
+            (actual_clipped.var() + reference_clipped.var()) / size
         )
         self.assertLess(
-            abs(float(actual.mean() - reference.mean())),
+            abs(float(actual_clipped.mean() - reference_clipped.mean())),
             6.0 * combined_mean_se,
         )
         self.assertLess(
-            abs(float(actual.var() - reference.var())) /
-            float(reference.var()),
+            abs(float(actual_clipped.var() - reference_clipped.var())) /
+            float(reference_clipped.var()),
             0.05,
+        )
+        self.assertLess(
+            abs(float((actual >= 1.0).mean()) -
+                float((reference >= 1.0).mean())),
+            0.01,
         )
         self.assertIn("delta + GIG", backend.profile_summary())
 
