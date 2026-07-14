@@ -15,7 +15,7 @@ from beta_backend import (
     CpuBetaBackend,
     CudaBetaBackend,
     CudaDirectBetaBackend,
-    CudaFusedSolveBetaBackend,
+    CudaFp32BetaBackend,
     CudaPcgBetaBackend,
     diagnose_ld_blocks,
     format_ld_diagnostics,
@@ -224,10 +224,9 @@ class CudaBetaBackendTests(unittest.TestCase):
         self.assertAlmostEqual(actual_quad, expected_quad, places=10)
         self.assertIn("potrfBatched", direct.describe())
 
-    def test_fused_solve_backend_matches_direct_cuda_draw(self):
+    def test_fp32_backend_tracks_analytic_conditional_mean(self):
         blocks, sizes, beta_mrg, psi = _inputs()
-        sigma = 0.7
-        direct = CudaDirectBetaBackend(
+        backend = CudaFp32BetaBackend(
             blocks,
             sizes,
             beta_mrg,
@@ -235,23 +234,60 @@ class CudaBetaBackendTests(unittest.TestCase):
             seed=123,
             cuda_bucket_size=4,
         )
-        fused = CudaFusedSolveBetaBackend(
-            blocks,
-            sizes,
-            beta_mrg,
-            1000,
-            seed=123,
-            cuda_bucket_size=4,
-        )
+        beta, quad = backend.sample(psi, 0.0)
 
-        expected_beta, expected_quad = direct.sample(psi, sigma)
-        actual_beta, actual_quad = fused.sample(psi, sigma)
+        expected_beta = np.empty_like(beta_mrg)
+        expected_quad = 0.0
+        start = 0
+        for ld, size in zip(blocks, sizes):
+            if not size:
+                continue
+            block_slice = slice(start, start + size)
+            precision = ld + np.diag(1.0 / psi[block_slice, 0])
+            expected_beta[block_slice] = np.linalg.solve(
+                precision, beta_mrg[block_slice]
+            )
+            expected_quad += (
+                expected_beta[block_slice].T @ precision @
+                expected_beta[block_slice]
+            ).item()
+            start += size
 
         np.testing.assert_allclose(
-            actual_beta, expected_beta, rtol=1e-10, atol=1e-10
+            beta, expected_beta, rtol=2e-5, atol=2e-6
         )
-        self.assertAlmostEqual(actual_quad, expected_quad, places=9)
-        self.assertIn("fused one-RHS", fused.describe())
+        self.assertAlmostEqual(
+            quad / expected_quad, 1.0, places=5
+        )
+        self.assertIn("approximate", backend.describe())
+
+    def test_fp32_backend_matches_conditional_moments(self):
+        ld = np.array([[1.0, 0.25], [0.25, 0.8]])
+        beta_mrg = np.array([[0.1], [-0.2]])
+        psi = np.array([[0.4], [0.9]])
+        sigma = 0.7
+        n_gwas = 100
+        precision = ld + np.diag(1.0 / psi[:, 0])
+        expected_mean = np.linalg.solve(precision, beta_mrg)[:, 0]
+        expected_scale = sigma / n_gwas
+        chol = np.linalg.cholesky(precision)
+
+        backend = CudaFp32BetaBackend(
+            [ld], [2], beta_mrg, n_gwas,
+            seed=321, cuda_bucket_size=1,
+        )
+        draws = np.empty((2048, 2))
+        for index in range(draws.shape[0]):
+            draws[index] = backend.sample(psi, sigma)[0][:, 0]
+
+        standardized = (
+            (draws - expected_mean) @ chol / np.sqrt(expected_scale)
+        )
+        self.assertLess(float(np.max(np.abs(standardized.mean(axis=0)))),
+                        0.08)
+        covariance = np.cov(standardized, rowvar=False, bias=True)
+        self.assertLess(float(np.max(np.abs(covariance - np.eye(2)))),
+                        0.10)
 
     def test_irregular_padded_blocks_have_correct_quadratic_form(self):
         blocks, sizes, beta_mrg, psi = _inputs()

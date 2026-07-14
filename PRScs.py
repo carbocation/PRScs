@@ -12,7 +12,7 @@ Usage:
 python PRScs.py --ref_dir=PATH_TO_REFERENCE --bim_prefix=VALIDATION_BIM_PREFIX --sst_file=SUM_STATS_FILE --n_gwas=GWAS_SAMPLE_SIZE --out_dir=OUTPUT_DIR
                 [--a=PARAM_A --b=PARAM_B --phi=PARAM_PHI --n_iter=MCMC_ITERATIONS --n_burnin=MCMC_BURNIN --thin=MCMC_THINNING_FACTOR
                  --chrom=CHROM --write_psi=WRITE_PSI --write_pst=WRITE_POSTERIOR_SAMPLES --seed=SEED
-                 --backend=cpu|cuda|cuda-direct|cuda-fused-solve|cuda-pcg --cuda_device=DEVICE --cuda_bucket_size=SIZE
+                 --backend=cpu|cuda|cuda-direct|cuda-fp32|cuda-pcg --cuda_device=DEVICE --cuda_bucket_size=SIZE
                  --pcg_tol=TOL --pcg_maxiter=ITERATIONS --pcg_check_interval=ITERATIONS
                  --ld_diagnostics=TRUE|FALSE --ld_rank_tol=TOL
                  --psi_backend=cpu|cuda|cuda-raw|cuda-fused
@@ -111,9 +111,9 @@ def parse_param():
         print('* Please specify the output directory using --out_dir\n')
         sys.exit(2)
     elif param_dict['backend'] not in (
-            'cpu', 'cuda', 'cuda-direct', 'cuda-fused-solve', 'cuda-pcg'):
+            'cpu', 'cuda', 'cuda-direct', 'cuda-fp32', 'cuda-pcg'):
         print('* --backend must be cpu, cuda, cuda-direct, '
-              'cuda-fused-solve or cuda-pcg\n')
+              'cuda-fp32 or cuda-pcg\n')
         sys.exit(2)
     elif param_dict['cuda_device'] < 0:
         print('* --cuda_device must be non-negative\n')
