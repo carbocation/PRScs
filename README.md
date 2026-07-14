@@ -110,7 +110,7 @@ using GWAS summary statistics and an external LD reference panel.
 ## Using PRS-CS
 
 `
-python PRScs.py --ref_dir=PATH_TO_REFERENCE --bim_prefix=VALIDATION_BIM_PREFIX --sst_file=SUM_STATS_FILE --n_gwas=GWAS_SAMPLE_SIZE --out_dir=OUTPUT_DIR [--a=PARAM_A --b=PARAM_B --phi=PARAM_PHI --n_iter=MCMC_ITERATIONS --n_burnin=MCMC_BURNIN --thin=MCMC_THINNING_FACTOR --chrom=CHROM --beta_std=BETA_STD --write_psi=WRITE_PSI --write_pst=WRITE_POSTERIOR_SAMPLES --seed=SEED --backend=cpu|cuda --cuda_device=DEVICE --cuda_bucket_size=SIZE --profile=TRUE|FALSE]
+python PRScs.py --ref_dir=PATH_TO_REFERENCE --bim_prefix=VALIDATION_BIM_PREFIX --sst_file=SUM_STATS_FILE --n_gwas=GWAS_SAMPLE_SIZE --out_dir=OUTPUT_DIR [--a=PARAM_A --b=PARAM_B --phi=PARAM_PHI --n_iter=MCMC_ITERATIONS --n_burnin=MCMC_BURNIN --thin=MCMC_THINNING_FACTOR --chrom=CHROM --beta_std=BETA_STD --write_psi=WRITE_PSI --write_pst=WRITE_POSTERIOR_SAMPLES --seed=SEED --backend=cpu|cuda|cuda-pcg --cuda_device=DEVICE --cuda_bucket_size=SIZE --pcg_tol=TOL --pcg_maxiter=ITERATIONS --pcg_check_interval=ITERATIONS --ld_diagnostics=TRUE|FALSE --ld_rank_tol=TOL --profile=TRUE|FALSE]
 `
  - PATH_TO_REFERENCE (required): Full path (including folder name) to the directory that contains information on the LD reference panel (the snpinfo file and hdf5 files). If the 1000 Genomes reference panel is used, folder name would be `ldblk_1kg_afr`, `ldblk_1kg_amr`, `ldblk_1kg_eas`, `ldblk_1kg_eur` or `ldblk_1kg_sas`; if the UK Biobank reference panel is used, folder name would be `ldblk_ukbb_afr`, `ldblk_ukbb_amr`, `ldblk_ukbb_eas`, `ldblk_ukbb_eur` or `ldblk_ukbb_sas`. Note that the reference panel should match the ancestry of the GWAS sample (not the target sample).
 
@@ -180,11 +180,19 @@ where SNP is the rs ID, A1 is the effect allele, A2 is the alternative allele, B
 
 - SEED (optional): Non-negative integer which seeds the random number generator.
 
-- BACKEND (optional): Backend for the within-chromosome beta block update. `cpu` uses SciPy and is the default. `cuda` uses the experimental CuPy implementation. This option does not change how chromosomes are scheduled.
+- BACKEND (optional): Backend for the within-chromosome beta block update. `cpu` uses SciPy and is the default. `cuda` uses batched FP64 Cholesky. `cuda-pcg` uses experimental FP64 perturb-and-solve with batched preconditioned conjugate gradients. This option does not change how chromosomes are scheduled.
 
 - DEVICE (optional): Zero-based CUDA device number. Default is 0.
 
 - SIZE (optional): CUDA block-size bucketing quantum. LD blocks are padded to the next multiple of this value so similarly sized blocks can use batched factorizations. Default is 32. Smaller values reduce padding and GPU memory use; larger values may create fewer batches at the cost of additional cubic work.
+
+- TOL (optional): Relative residual tolerance for `cuda-pcg`. Default is `1e-10`. A draw fails explicitly if its true residual exceeds this tolerance; inaccurate solves are not silently accepted.
+
+- ITERATIONS (optional): Maximum PCG iterations, default 100, and the interval between device-to-host convergence checks, default 4.
+
+- LD_DIAGNOSTICS (optional): If True, report real block sizes, padding overhead, eigenvalue bounds and numerical rank before MCMC. Default is False because the rank calculation is not free for non-PCG backends.
+
+- LD_RANK_TOL (optional): Relative eigenvalue threshold used only to report effective LD rank. Default is `1e-8`; the FP64 PCG backend retains every non-negative eigencomponent and does not truncate at this threshold.
 
 - PROFILE (optional): If True, report warm-up and steady-state mean time spent in the beta update, `psi` update and remaining within-chromosome work. The first iteration is excluded from steady-state means. Default is False.
 
@@ -205,9 +213,9 @@ export OMP_NUM_THREADS=$N_THREADS
 ```
 For example, to use a single thread for the computation, set `N_THREADS=1`.
 
-### Experimental within-chromosome CUDA backend
+### Experimental within-chromosome CUDA backends
 
-The CUDA backend accelerates the repeated Cholesky factorizations and triangular solves within one chromosome. It deliberately does not provide chromosome-level scheduling: chromosomes can already be submitted as independent jobs on separate machines.
+The CUDA backends accelerate the beta block update within one chromosome. They deliberately do not provide chromosome-level scheduling: chromosomes can already be submitted as independent jobs on separate machines.
 
 Install CuPy 14.1 or newer using the package that matches the machine's CUDA runtime. For example, a CUDA 12 installation typically uses:
 
@@ -221,11 +229,27 @@ Then add the backend options to an otherwise normal command:
 python PRScs.py ... --chrom=22 --backend=cuda --cuda_device=0 --profile=True
 ```
 
-LD matrices and marginal effects are transferred to the selected device once. Each MCMC iteration transfers one `psi` vector to CUDA and returns one beta vector plus the quadratic form. Unequal LD blocks are grouped by padded size and processed with batched CuPy Cholesky and triangular-solve routines. All calculations remain in double precision.
+`cuda` groups padded LD blocks and uses batched CuPy Cholesky and triangular solves. `cuda-pcg` draws an exact Gaussian perturbation and solves the resulting precision systems with diagonally preconditioned FP64 conjugate gradients:
+
+```
+python PRScs.py ... --chrom=22 --backend=cuda-pcg --pcg_tol=1e-10 --pcg_maxiter=100 --ld_diagnostics=True --profile=True
+```
+
+The PCG formulation preserves the same conditional Gaussian target to the configured linear-solve tolerance. The PSD eigendecomposition already needed while parsing LD supplies the fixed square-root factor used to draw each perturbation. Exactly zero PSD components are omitted and factors are bucketed by both matrix size and rank. The reported numerical-rank threshold is diagnostic only; no positive eigenvalues are discarded.
+
+LD matrices and marginal effects are transferred to the selected device once. Each MCMC iteration transfers one `psi` vector to CUDA and returns one beta vector plus the quadratic form. Unequal LD blocks are grouped by padded size. All calculations remain in double precision.
 
 The CPU and CUDA backends use different random-number generators, so seeded runs are reproducible within a fixed backend configuration but are not expected to produce identical draws across backends. Validate posterior summaries rather than individual samples. CuPy does not guarantee an identical random stream across major CuPy versions.
 
-GPU benefit depends strongly on the real LD block-size distribution and hardware FP64 throughput. Compare elapsed time for the same single chromosome after excluding the first iteration, which includes CUDA library initialization. The backend reports its number of size buckets and static resident GPU memory when the sampler starts; CUDA solver workspaces and the CuPy memory pool require additional memory.
+GPU benefit depends strongly on the real LD block-size distribution and hardware FP64 throughput. Compare elapsed time for the same single chromosome after excluding the first iteration, which includes CUDA library initialization. The backend reports its number of size buckets and static resident GPU memory when the sampler starts; CUDA solver workspaces and the CuPy memory pool require additional memory. For PCG, also inspect the reported mean/max iteration count and maximum true residual. Cholesky remains the correctness and performance fallback when PCG needs too many iterations.
+
+Run the self-contained 40,000-variant benchmark with:
+
+```
+python3 benchmark_gpu.py
+```
+
+The default comparison runs `cpu`, `cuda`, and `cuda-pcg`. Use, for example, `--backends=cuda,cuda-pcg --n-iter=100` for a longer GPU-only comparison. The benchmark does not install or modify CUDA packages or drivers.
 
 
 ## Test Data

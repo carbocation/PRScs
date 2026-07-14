@@ -14,7 +14,9 @@ from beta_backend import make_beta_backend
 
 
 def mcmc(a, b, phi, sst_dict, n, ld_blk, blk_size, n_iter, n_burnin, thin, chrom, out_dir, beta_std, write_psi, write_pst, seed,
-         backend='cpu', cuda_device=0, cuda_bucket_size=32, profile='FALSE'):
+         backend='cpu', cuda_device=0, cuda_bucket_size=32, profile='FALSE',
+         pcg_tol=1e-10, pcg_maxiter=100, pcg_check_interval=4,
+         ld_rank_tol=1e-8, ld_factors=None, ld_eigenvalues=None):
     print('... MCMC ...')
 
     # seed
@@ -51,6 +53,12 @@ def mcmc(a, b, phi, sst_dict, n, ld_blk, blk_size, n_iter, n_burnin, thin, chrom
         seed=seed,
         cuda_device=cuda_device,
         cuda_bucket_size=cuda_bucket_size,
+        pcg_tol=pcg_tol,
+        pcg_maxiter=pcg_maxiter,
+        pcg_check_interval=pcg_check_interval,
+        ld_rank_tol=ld_rank_tol,
+        ld_factors=ld_factors,
+        ld_eigenvalues=ld_eigenvalues,
     )
     print('... beta backend: %s ...' % beta_backend.describe())
     profile = str(profile).upper() == 'TRUE'
@@ -165,5 +173,9 @@ def mcmc(a, b, phi, sst_dict, n, ld_blk, blk_size, n_iter, n_burnin, thin, chrom
     # print estimated phi
     if phi_updt == True:
         print('... Estimated global shrinkage parameter: %1.2e ...' % phi_est )
+
+    if profile and hasattr(beta_backend, 'profile_summary'):
+        print('[PROFILE chr%d] %s' %
+              (chrom, beta_backend.profile_summary()))
 
     print('... Done ...')

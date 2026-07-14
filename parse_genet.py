@@ -13,6 +13,23 @@ from scipy import linalg
 import h5py
 
 
+def _project_ld_psd(ld):
+    """Project symmetric LD onto the PSD cone and return its square root."""
+    symmetric_ld = (
+        np.asarray(ld, dtype=np.float64) +
+        np.asarray(ld, dtype=np.float64).T
+    ) * 0.5
+    eigenvalues, eigenvectors = linalg.eigh(
+        symmetric_ld, check_finite=False
+    )
+    eigenvalues = np.maximum(eigenvalues, 0.0)
+    projected = np.dot(
+        eigenvectors * eigenvalues[None, :], eigenvectors.T
+    )
+    factor = eigenvectors * np.sqrt(eigenvalues)[None, :]
+    return projected, factor, eigenvalues
+
+
 def parse_ref(ref_file, chrom):
     print('... parse reference file: %s ...' % ref_file)
 
@@ -157,7 +174,7 @@ def parse_sumstats(ref_dict, vld_dict, sst_file, n_subj):
     return sst_dict
 
 
-def parse_ldblk(ldblk_dir, sst_dict, chrom):
+def parse_ldblk(ldblk_dir, sst_dict, chrom, return_factors=False):
     print('... parse reference LD on chromosome %d ...' % chrom)
 
     if '1kg' in os.path.basename(ldblk_dir):
@@ -174,6 +191,8 @@ def parse_ldblk(ldblk_dir, sst_dict, chrom):
         snp_blk.append([bb.decode("UTF-8") for bb in list(hdf_chr['blk_'+str(blk)]['snplist'])])
 
     blk_size = []
+    ld_factors = []
+    ld_eigenvalues = []
     mm = 0
     for blk in range(n_blk):
         idx = [ii for (ii, snp) in enumerate(snp_blk[blk]) if snp in sst_dict['SNP']]
@@ -183,14 +202,24 @@ def parse_ldblk(ldblk_dir, sst_dict, chrom):
             flip = [sst_dict['FLP'][jj] for jj in idx_blk]
             ld_blk[blk] = ld_blk[blk][np.ix_(idx,idx)]*np.outer(flip,flip)
 
-            _, s, v = linalg.svd(ld_blk[blk])
-            h = np.dot(v.T, np.dot(np.diag(s), v))
-            ld_blk[blk] = (ld_blk[blk]+h)/2            
+            # Project the symmetric LD matrix onto the PSD cone.  The
+            # previous SVD/polar implementation is equivalent for symmetric
+            # input, but an eigendecomposition also exposes the square-root
+            # factor needed by the perturb-and-solve CUDA backend.
+            ld_blk[blk], factor, eigenvalues = _project_ld_psd(
+                ld_blk[blk]
+            )
+            if return_factors:
+                ld_factors.append(factor)
+                ld_eigenvalues.append(eigenvalues)
 
             mm += len(idx)
         else:
             ld_blk[blk] = np.array([])
+            if return_factors:
+                ld_factors.append(np.empty((0, 0), dtype=np.float64))
+                ld_eigenvalues.append(np.empty(0, dtype=np.float64))
 
+    if return_factors:
+        return ld_blk, blk_size, ld_factors, ld_eigenvalues
     return ld_blk, blk_size
-
-
