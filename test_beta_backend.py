@@ -309,9 +309,10 @@ class CudaBetaBackendTests(unittest.TestCase):
             actual_beta, expected_beta, rtol=1e-10, atol=1e-10
         )
         self.assertAlmostEqual(actual_quad, expected_quad, places=10)
-        self.assertIn("2 concurrent streams", streamed.describe())
+        self.assertIn("2 factorization streams", streamed.describe())
+        self.assertIn("2 auxiliary streams", streamed.describe())
         self.assertIn(
-            "3 independently scheduled solver tasks", streamed.describe()
+            "3 independently scheduled factor tasks", streamed.describe()
         )
 
     def test_stream_backend_keeps_dense_bucket_as_one_task(self):
@@ -326,9 +327,9 @@ class CudaBetaBackendTests(unittest.TestCase):
             cuda_streams=4,
         )
 
-        self.assertIn("1 concurrent stream", backend.describe())
+        self.assertIn("1 factorization stream", backend.describe())
         self.assertIn(
-            "1 independently scheduled solver task", backend.describe()
+            "1 independently scheduled factor task", backend.describe()
         )
         self.assertIn("8 batched matrices", backend.describe())
 

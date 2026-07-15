@@ -1046,32 +1046,35 @@ class CudaStreamsBetaBackend(CudaHybridBetaBackend):
             )
 
         cp = self._cp
-        solver_tasks = []
+        factor_tasks = []
         for group in self._groups:
             count = int(group["precision"].shape[0])
             if group["use_unbatched"]:
-                solver_tasks.extend(
+                factor_tasks.extend(
                     (group, matrix_index)
                     for matrix_index in range(count)
                 )
             else:
-                solver_tasks.append((group, None))
+                factor_tasks.append((group, None))
 
-        self._solver_task_count = len(solver_tasks)
-        self._stream_count = min(requested_streams, self._solver_task_count)
+        self._factor_task_count = len(factor_tasks)
+        self._stream_count = min(requested_streams, self._factor_task_count)
+        self._auxiliary_stream_count = min(
+            8, self._stream_count, len(self._groups)
+        )
 
-        def distribute(items, cost):
-            lanes = [[] for _ in range(self._stream_count)]
-            lane_work = [0] * self._stream_count
+        def distribute(items, cost, lane_count):
+            lanes = [[] for _ in range(lane_count)]
+            lane_work = [0] * lane_count
             for item in sorted(items, key=cost, reverse=True):
                 lane = min(
-                    range(self._stream_count), key=lane_work.__getitem__
+                    range(lane_count), key=lane_work.__getitem__
                 )
                 lanes[lane].append(item)
                 lane_work[lane] += cost(item)
             return lanes
 
-        def solver_cost(task):
+        def factor_cost(task):
             group, matrix_index = task
             size = int(group["precision"].shape[-1])
             count = (
@@ -1080,13 +1083,16 @@ class CudaStreamsBetaBackend(CudaHybridBetaBackend):
             )
             return count * size ** 3
 
-        self._lane_solver_tasks = distribute(solver_tasks, solver_cost)
+        self._lane_factor_tasks = distribute(
+            factor_tasks, factor_cost, self._stream_count
+        )
         self._lane_groups = distribute(
             self._groups,
             lambda group: (
                 int(group["precision"].shape[0]) *
                 int(group["precision"].shape[-1]) ** 2
             ),
+            self._auxiliary_stream_count,
         )
 
         self._lane_cublas_handles = []
@@ -1122,7 +1128,7 @@ class CudaStreamsBetaBackend(CudaHybridBetaBackend):
                     self._cusolver.setStream(cusolver_handle, stream.ptr)
 
                 self._lane_workspaces = []
-                for tasks in self._lane_solver_tasks:
+                for tasks in self._lane_factor_tasks:
                     maximum_lwork = max(
                         (
                             int(group.get("single_lwork", 0))
@@ -1188,7 +1194,7 @@ class CudaStreamsBetaBackend(CudaHybridBetaBackend):
                     operation(lane, item)
                 stream.record(self._lane_completion[stage_index][lane])
 
-        for event in self._lane_completion[stage_index]:
+        for event in self._lane_completion[stage_index][:len(lane_items)]:
             default_stream.wait_event(event)
         default_stream.record(self._stream_boundaries[stage_index + 1])
 
@@ -1256,7 +1262,7 @@ class CudaStreamsBetaBackend(CudaHybridBetaBackend):
                     )
 
             self._dispatch_stage(
-                1, self._lane_solver_tasks, factor
+                1, self._lane_factor_tasks, factor
             )
 
             if not self._potrf_checked:
@@ -1271,29 +1277,16 @@ class CudaStreamsBetaBackend(CudaHybridBetaBackend):
                             (group_index, first, int(info[first]))
                         )
 
-            def solve_first(lane, task):
-                group, matrix_index = task
-                if matrix_index is None:
-                    cp.copyto(group["rhs"], group["beta_mrg"])
-                    self._solve_group(
-                        group,
-                        self._cublas.CUBLAS_OP_T,
-                        self._lane_cublas_handles[lane],
-                    )
-                else:
-                    cp.copyto(
-                        group["rhs"][matrix_index],
-                        group["beta_mrg"][matrix_index],
-                    )
-                    self._solve_matrix(
-                        group,
-                        matrix_index,
-                        self._cublas.CUBLAS_OP_T,
-                        self._lane_cublas_handles[lane],
-                    )
+            def solve_first(lane, group):
+                cp.copyto(group["rhs"], group["beta_mrg"])
+                self._solve_group(
+                    group,
+                    self._cublas.CUBLAS_OP_T,
+                    self._lane_cublas_handles[lane],
+                )
 
             self._dispatch_stage(
-                2, self._lane_solver_tasks, solve_first
+                2, self._lane_groups, solve_first
             )
 
             def perturb(_lane, group):
@@ -1316,29 +1309,13 @@ class CudaStreamsBetaBackend(CudaHybridBetaBackend):
 
             self._dispatch_stage(3, self._lane_groups, perturb)
 
-            def solve_second(lane, task):
-                group, matrix_index = task
-                if matrix_index is None:
-                    self._solve_group(
-                        group,
-                        self._cublas.CUBLAS_OP_N,
-                        self._lane_cublas_handles[lane],
-                    )
-                    rhs = group["rhs"]
-                    indices = group["indices"]
-                    valid = group["valid"]
-                else:
-                    self._solve_matrix(
-                        group,
-                        matrix_index,
-                        self._cublas.CUBLAS_OP_N,
-                        self._lane_cublas_handles[lane],
-                    )
-                    rhs = group["rhs"][matrix_index]
-                    indices = group["indices"][matrix_index]
-                    valid = group["valid"][matrix_index]
-
-                entries = int(indices.size)
+            def solve_second(lane, group):
+                self._solve_group(
+                    group,
+                    self._cublas.CUBLAS_OP_N,
+                    self._lane_cublas_handles[lane],
+                )
+                entries = int(group["indices"].size)
                 blocks = (
                     (entries + self._kernel_threads - 1) //
                     self._kernel_threads
@@ -1347,16 +1324,16 @@ class CudaStreamsBetaBackend(CudaHybridBetaBackend):
                     (blocks,),
                     (self._kernel_threads,),
                     (
-                        rhs,
-                        indices,
-                        valid,
+                        group["rhs"],
+                        group["indices"],
+                        group["valid"],
                         self._beta_result,
                         np.uint64(entries),
                     ),
                 )
 
             self._dispatch_stage(
-                4, self._lane_solver_tasks, solve_second
+                4, self._lane_groups, solve_second
             )
 
             self._potrf_checked = True
@@ -1384,17 +1361,22 @@ class CudaStreamsBetaBackend(CudaHybridBetaBackend):
 
     def describe(self):
         stream_word = "stream" if self._stream_count == 1 else "streams"
-        task_word = "task" if self._solver_task_count == 1 else "tasks"
+        auxiliary_word = (
+            "stream" if self._auxiliary_stream_count == 1 else "streams"
+        )
+        task_word = "task" if self._factor_task_count == 1 else "tasks"
         return (
-            "cuda-streams:%d (exact FP64; %d concurrent %s, "
-            "%d independently scheduled solver %s; fused assembly/"
-            "perturb/scatter; %d regular and %d batched matrices; %.1f "
-            "MiB static resident)" %
+            "cuda-streams:%d (exact FP64; %d factorization %s, %d "
+            "auxiliary %s; %d independently scheduled factor %s; "
+            "fused assembly/perturb/scatter; %d regular and %d batched "
+            "matrices; %.1f MiB static resident)" %
             (
                 self._device.id,
                 self._stream_count,
                 stream_word,
-                self._solver_task_count,
+                self._auxiliary_stream_count,
+                auxiliary_word,
+                self._factor_task_count,
                 task_word,
                 self._unbatched_matrices,
                 self._batched_matrices,
