@@ -6,6 +6,7 @@
 import os
 import tempfile
 import unittest
+from unittest import mock
 
 import h5py
 import numpy as np
@@ -241,6 +242,56 @@ class CpuBetaBackendTests(unittest.TestCase):
             np.sort(eigenvalues[0]),
             rtol=1e-12, atol=1e-12,
         )
+
+    def test_ld_cache_reuses_exact_projection_and_tracks_allele_flips(self):
+        with tempfile.TemporaryDirectory(prefix="ldblk_1kg_") as directory:
+            filename = os.path.join(directory, "ldblk_1kg_chr22.hdf5")
+            cache_dir = os.path.join(directory, "cache")
+            with h5py.File(filename, "w") as handle:
+                group = handle.create_group("blk_1")
+                group.create_dataset(
+                    "ldblk",
+                    data=np.array([
+                        [1.0, 0.2, 0.1],
+                        [0.2, 1.0, 0.3],
+                        [0.1, 0.3, 1.0],
+                    ]),
+                )
+                group.create_dataset(
+                    "snplist", data=np.asarray([b"rs1", b"rs2", b"rs3"])
+                )
+
+            sst = {"SNP": ["rs1", "rs3"], "FLP": [1, -1]}
+            with mock.patch(
+                    "parse_genet._project_ld_psd",
+                    wraps=_project_ld_psd) as projection:
+                first_blocks, first_sizes = parse_ldblk(
+                    directory, sst, 22, cache_dir=cache_dir
+                )
+                self.assertEqual(projection.call_count, 1)
+
+            with mock.patch(
+                    "parse_genet._project_ld_psd",
+                    side_effect=AssertionError("cache miss")):
+                cached_blocks, cached_sizes = parse_ldblk(
+                    directory, sst, 22, cache_dir=cache_dir
+                )
+
+            self.assertEqual(cached_sizes, first_sizes)
+            self.assertTrue(cached_blocks[0].flags.f_contiguous)
+            np.testing.assert_array_equal(cached_blocks[0], first_blocks[0])
+
+            changed = {"SNP": ["rs1", "rs3"], "FLP": [1, 1]}
+            with mock.patch(
+                    "parse_genet._project_ld_psd",
+                    wraps=_project_ld_psd) as projection:
+                changed_blocks, _ = parse_ldblk(
+                    directory, changed, 22, cache_dir=cache_dir
+                )
+                self.assertEqual(projection.call_count, 1)
+            self.assertFalse(np.array_equal(
+                changed_blocks[0], cached_blocks[0]
+            ))
 
 
 @unittest.skipUnless(_cuda_available(), "CuPy and a CUDA device are required")

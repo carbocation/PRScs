@@ -15,6 +15,7 @@ python PRScs.py --ref_dir=PATH_TO_REFERENCE --bim_prefix=VALIDATION_BIM_PREFIX -
                  --backend=cpu|cuda|cuda-direct|cuda-hybrid|cuda-streams|cuda-adaptive|cuda-fp32|cuda-fp32-streams|cuda-pcg --cuda_device=DEVICE --cuda_bucket_size=SIZE --cuda_streams=STREAMS
                  --pcg_tol=TOL --pcg_maxiter=ITERATIONS --pcg_check_interval=ITERATIONS
                  --ld_diagnostics=TRUE|FALSE --ld_rank_tol=TOL
+                 --ld_cache_dir=PATH
                  --psi_backend=cpu|cuda|cuda-raw|cuda-fused
                  --cuda_gig_max_rounds=ROUNDS
                  --profile=TRUE|FALSE]
@@ -39,7 +40,7 @@ def parse_param():
         'backend=', 'cuda_device=', 'cuda_bucket_size=', 'cuda_streams=',
         'profile=',
         'pcg_tol=', 'pcg_maxiter=', 'pcg_check_interval=',
-        'ld_diagnostics=', 'ld_rank_tol=', 'psi_backend=',
+        'ld_diagnostics=', 'ld_rank_tol=', 'ld_cache_dir=', 'psi_backend=',
         'cuda_gig_max_rounds=',
     ]
 
@@ -51,7 +52,8 @@ def parse_param():
                   'cuda_streams': 4, 'profile': 'FALSE',
                   'pcg_tol': 1e-10, 'pcg_maxiter': 100,
                   'pcg_check_interval': 4, 'ld_diagnostics': 'FALSE',
-                  'ld_rank_tol': 1e-8, 'psi_backend': 'cpu',
+                  'ld_rank_tol': 1e-8, 'ld_cache_dir': None,
+                  'psi_backend': 'cpu',
                   'cuda_gig_max_rounds': 1000}
 
     print('\n')
@@ -94,6 +96,7 @@ def parse_param():
             elif opt == "--pcg_check_interval": param_dict['pcg_check_interval'] = int(arg)
             elif opt == "--ld_diagnostics": param_dict['ld_diagnostics'] = arg.upper()
             elif opt == "--ld_rank_tol": param_dict['ld_rank_tol'] = float(arg)
+            elif opt == "--ld_cache_dir": param_dict['ld_cache_dir'] = arg
             elif opt == "--psi_backend": param_dict['psi_backend'] = arg.lower()
             elif opt == "--cuda_gig_max_rounds": param_dict['cuda_gig_max_rounds'] = int(arg)
             elif opt == "--joint_chromosomes": param_dict['joint_chromosomes'] = arg.upper()
@@ -196,10 +199,12 @@ def _load_chromosome(param_dict, chrom):
             parse_genet.parse_ldblk(
                 param_dict['ref_dir'], sst_dict, chrom,
                 return_factors=True,
+                cache_dir=param_dict['ld_cache_dir'],
             )
     else:
         ld_blk, blk_size = parse_genet.parse_ldblk(
-            param_dict['ref_dir'], sst_dict, chrom
+            param_dict['ref_dir'], sst_dict, chrom,
+            cache_dir=param_dict['ld_cache_dir'],
         )
         ld_factors = None
         ld_eigenvalues = None
@@ -240,11 +245,13 @@ def _load_joint_chromosomes(param_dict, chromosomes):
                 parse_genet.parse_ldblk(
                     param_dict['ref_dir'], sst_dict, chromosome,
                     return_factors=True, report_timing=True,
+                    cache_dir=param_dict['ld_cache_dir'],
                 )
         else:
             ld_blk, blk_size = parse_genet.parse_ldblk(
                 param_dict['ref_dir'], sst_dict, chromosome,
                 report_timing=True,
+                cache_dir=param_dict['ld_cache_dir'],
             )
             ld_factors = None
             ld_eigenvalues = None
