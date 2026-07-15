@@ -241,6 +241,12 @@ def _combine_chromosomes(chromosome_inputs):
         chromosome_sst = chromosome_input['sst_dict']
         if set(chromosome_sst) != set(sst_dict):
             raise ValueError('all chromosome summary dictionaries must match')
+        if not chromosome_sst['SNP']:
+            raise ValueError(
+                'no common SNPs found for selected chromosome %d; '
+                'joint chromosome sampling requires data for every '
+                'selected chromosome' % chromosome
+            )
         if len(chromosome_input['ld_blk']) != len(
                 chromosome_input['blk_size']):
             raise ValueError(

@@ -41,8 +41,20 @@ def _chromosome_partitions(chrom, chromosome_slices, p):
 def _profile_label(partitions, joint_chromosomes):
     if not joint_chromosomes:
         return 'chr%d' % partitions[0][0]
-    chromosomes = ','.join(str(partition[0]) for partition in partitions)
-    return 'joint chr%s' % chromosomes
+
+    chromosomes = [partition[0] for partition in partitions]
+    ranges = []
+    start = chromosomes[0]
+    end = start
+    for chromosome in chromosomes[1:]:
+        if chromosome == end + 1:
+            end = chromosome
+            continue
+        ranges.append(str(start) if start == end else '%d-%d' % (start, end))
+        start = chromosome
+        end = chromosome
+    ranges.append(str(start) if start == end else '%d-%d' % (start, end))
+    return 'joint chr%s' % ','.join(ranges)
 
 
 def mcmc(a, b, phi, sst_dict, n, ld_blk, blk_size, n_iter, n_burnin, thin, chrom, out_dir, beta_std, write_psi, write_pst, seed,

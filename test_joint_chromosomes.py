@@ -96,6 +96,29 @@ class JointChromosomeInputTests(unittest.TestCase):
         self.assertIsNone(combined['ld_factors'])
         self.assertIsNone(combined['ld_eigenvalues'])
 
+    def test_empty_selected_chromosome_is_rejected(self):
+        inputs = [
+            {
+                'chrom': 1,
+                'sst_dict': _summary(1, []),
+                'ld_blk': [],
+                'blk_size': [],
+                'ld_factors': None,
+                'ld_eigenvalues': None,
+            },
+            {
+                'chrom': 2,
+                'sst_dict': _summary(2, ['rs2']),
+                'ld_blk': [np.eye(1)],
+                'blk_size': [1],
+                'ld_factors': None,
+                'ld_eigenvalues': None,
+            },
+        ]
+
+        with self.assertRaisesRegex(ValueError, 'selected chromosome 1'):
+            PRScs._combine_chromosomes(inputs)
+
 
 class JointChromosomeMainTests(unittest.TestCase):
     def setUp(self):
@@ -175,6 +198,13 @@ class _FixedPsiBackend:
 
 
 class JointChromosomeSamplerTests(unittest.TestCase):
+    def test_joint_profile_label_compacts_consecutive_chromosomes(self):
+        partitions = [(chromosome, 0, 0) for chromosome in range(1, 23)]
+        self.assertEqual(
+            mcmc_gtb._profile_label(partitions, True),
+            'joint chr1-22',
+        )
+
     def test_one_chain_updates_global_parameters_and_splits_outputs(self):
         summary = _summary(1, ['rs1', 'rs2'])
         second = _summary(2, ['rs3', 'rs4', 'rs5'])
