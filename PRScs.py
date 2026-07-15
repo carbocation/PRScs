@@ -25,6 +25,7 @@ python PRScs.py --ref_dir=PATH_TO_REFERENCE --bim_prefix=VALIDATION_BIM_PREFIX -
 import os
 import sys
 import getopt
+import time
 
 import parse_genet
 import mcmc_gtb
@@ -170,15 +171,18 @@ def parse_param():
     return param_dict
 
 
-def _load_chromosome(param_dict, chrom):
+def _reference_file(param_dict):
     if '1kg' in os.path.basename(param_dict['ref_dir']):
-        ref_file = param_dict['ref_dir'] + '/snpinfo_1kg_hm3'
+        return param_dict['ref_dir'] + '/snpinfo_1kg_hm3'
     elif 'ukbb' in os.path.basename(param_dict['ref_dir']):
-        ref_file = param_dict['ref_dir'] + '/snpinfo_ukbb_hm3'
-    else:
-        raise ValueError(
-            'reference directory name must contain either 1kg or ukbb'
-        )
+        return param_dict['ref_dir'] + '/snpinfo_ukbb_hm3'
+    raise ValueError(
+        'reference directory name must contain either 1kg or ukbb'
+    )
+
+
+def _load_chromosome(param_dict, chrom):
+    ref_file = _reference_file(param_dict)
 
     ref_dict = parse_genet.parse_ref(ref_file, chrom)
     vld_dict = parse_genet.parse_bim(param_dict['bim_prefix'], chrom)
@@ -208,6 +212,55 @@ def _load_chromosome(param_dict, chrom):
         'ld_factors': ld_factors,
         'ld_eigenvalues': ld_eigenvalues,
     }
+
+
+def _load_joint_chromosomes(param_dict, chromosomes):
+    """Load selected chromosomes without repeatedly scanning text inputs."""
+    total_started = time.perf_counter()
+    text_started = time.perf_counter()
+    ref_dicts = parse_genet.parse_ref_chromosomes(
+        _reference_file(param_dict), chromosomes
+    )
+    vld_dict = parse_genet.parse_bim_chromosomes(
+        param_dict['bim_prefix'], chromosomes
+    )
+    sst_dicts = parse_genet.parse_sumstats_chromosomes(
+        ref_dicts, vld_dict, param_dict['sst_file'], param_dict['n_gwas']
+    )
+    text_elapsed = time.perf_counter() - text_started
+    print('[LOAD joint] text inputs %.3fs' % text_elapsed)
+
+    need_ld_factors = param_dict['backend'] == 'cuda-pcg'
+    chromosome_inputs = []
+    for chromosome in chromosomes:
+        print('##### load chromosome %d LD #####' % chromosome)
+        sst_dict = sst_dicts[chromosome]
+        if need_ld_factors:
+            ld_blk, blk_size, ld_factors, ld_eigenvalues = \
+                parse_genet.parse_ldblk(
+                    param_dict['ref_dir'], sst_dict, chromosome,
+                    return_factors=True, report_timing=True,
+                )
+        else:
+            ld_blk, blk_size = parse_genet.parse_ldblk(
+                param_dict['ref_dir'], sst_dict, chromosome,
+                report_timing=True,
+            )
+            ld_factors = None
+            ld_eigenvalues = None
+
+        chromosome_inputs.append({
+            'chrom': chromosome,
+            'sst_dict': sst_dict,
+            'ld_blk': ld_blk,
+            'blk_size': blk_size,
+            'ld_factors': ld_factors,
+            'ld_eigenvalues': ld_eigenvalues,
+        })
+
+    print('[LOAD joint] all inputs %.3fs' %
+          (time.perf_counter() - total_started))
+    return chromosome_inputs
 
 
 def _combine_chromosomes(chromosome_inputs):
@@ -342,10 +395,9 @@ def main():
             '##### jointly process chromosomes %s #####' %
             ','.join(str(chrom) for chrom in chromosomes)
         )
-        chromosome_inputs = []
-        for chrom in chromosomes:
-            print('##### load chromosome %d #####' % chrom)
-            chromosome_inputs.append(_load_chromosome(param_dict, chrom))
+        chromosome_inputs = _load_joint_chromosomes(
+            param_dict, chromosomes
+        )
 
         joint_input = _combine_chromosomes(chromosome_inputs)
         _print_ld_diagnostics(param_dict, joint_input)

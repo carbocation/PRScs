@@ -237,6 +237,8 @@ The joint mode is backend-independent. On a sufficiently large GPU, pooling LD b
 python PRScs.py ... --joint_chromosomes=True --backend=cuda-adaptive --cuda_streams=20 --psi_backend=cuda-fused --profile=True
 ```
 
+Joint mode scans the reference and BIM text files once and the summary-statistics file twice for all selected chromosomes, rather than repeating those whole-file scans for each chromosome. It also reports text-input and per-chromosome LD loading timings. The default chromosome-wise mode retains the original parsing path.
+
 ### Experimental CUDA backends
 
 The CUDA backends accelerate the independent LD-block beta updates. Without `--joint_chromosomes=True`, chromosomes remain separate jobs and can still be submitted to separate machines.
