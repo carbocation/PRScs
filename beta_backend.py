@@ -1143,8 +1143,17 @@ class CudaStreamsBetaBackend(CudaHybridBetaBackend):
 
         self._factor_task_count = len(factor_tasks)
         self._stream_count = min(requested_streams, self._factor_task_count)
+        solve_tasks = [
+            (group, matrix_index)
+            for group in self._groups
+            for matrix_index in range(int(group["precision"].shape[0]))
+        ]
+        self._solve_task_count = len(solve_tasks)
         self._auxiliary_stream_count = min(
-            8, self._stream_count, len(self._groups)
+            8, requested_streams, self._solve_task_count
+        )
+        self._worker_stream_count = max(
+            self._stream_count, self._auxiliary_stream_count
         )
 
         def distribute(items, cost, lane_count):
@@ -1170,13 +1179,18 @@ class CudaStreamsBetaBackend(CudaHybridBetaBackend):
         self._lane_factor_tasks = distribute(
             factor_tasks, factor_cost, self._stream_count
         )
+        self._lane_solve_tasks = distribute(
+            solve_tasks,
+            lambda task: int(task[0]["precision"].shape[-1]) ** 2,
+            self._auxiliary_stream_count,
+        )
         self._lane_groups = distribute(
             self._groups,
             lambda group: (
                 int(group["precision"].shape[0]) *
                 int(group["precision"].shape[-1]) ** 2
             ),
-            self._auxiliary_stream_count,
+            min(self._auxiliary_stream_count, len(self._groups)),
         )
 
         self._lane_cublas_handles = []
@@ -1210,7 +1224,7 @@ class CudaStreamsBetaBackend(CudaHybridBetaBackend):
                 self._kernel_threads = 256
                 self._streams = [
                     cp.cuda.Stream(non_blocking=True)
-                    for _ in range(self._stream_count)
+                    for _ in range(self._worker_stream_count)
                 ]
                 for stream in self._streams:
                     cublas_handle = self._cublas.create()
@@ -1256,7 +1270,9 @@ class CudaStreamsBetaBackend(CudaHybridBetaBackend):
                     cp.cuda.Event() for _ in range(6)
                 ]
                 self._lane_completion = [
-                    [cp.cuda.Event() for _ in range(self._stream_count)]
+                    [cp.cuda.Event() for _ in range(
+                        self._worker_stream_count
+                    )]
                     for _ in range(5)
                 ]
         except Exception:
@@ -1370,16 +1386,21 @@ class CudaStreamsBetaBackend(CudaHybridBetaBackend):
                             (group_index, first, int(info[first]))
                         )
 
-            def solve_first(lane, group):
-                cp.copyto(group["rhs"], group["beta_mrg"])
-                self._solve_group(
+            def solve_first(lane, task):
+                group, matrix_index = task
+                cp.copyto(
+                    group["rhs"][matrix_index],
+                    group["beta_mrg"][matrix_index],
+                )
+                self._solve_matrix(
                     group,
+                    matrix_index,
                     self._cublas.CUBLAS_OP_T,
                     self._lane_cublas_handles[lane],
                 )
 
             self._dispatch_stage(
-                2, self._lane_groups, solve_first
+                2, self._lane_solve_tasks, solve_first
             )
 
             def perturb(_lane, group):
@@ -1402,13 +1423,15 @@ class CudaStreamsBetaBackend(CudaHybridBetaBackend):
 
             self._dispatch_stage(3, self._lane_groups, perturb)
 
-            def solve_second(lane, group):
-                self._solve_group(
+            def solve_second(lane, task):
+                group, matrix_index = task
+                self._solve_matrix(
                     group,
+                    matrix_index,
                     self._cublas.CUBLAS_OP_N,
                     self._lane_cublas_handles[lane],
                 )
-                entries = int(group["indices"].size)
+                entries = int(group["indices"].shape[-1])
                 blocks = (
                     (entries + self._kernel_threads - 1) //
                     self._kernel_threads
@@ -1417,16 +1440,16 @@ class CudaStreamsBetaBackend(CudaHybridBetaBackend):
                     (blocks,),
                     (self._kernel_threads,),
                     (
-                        group["rhs"],
-                        group["indices"],
-                        group["valid"],
+                        group["rhs"][matrix_index],
+                        group["indices"][matrix_index],
+                        group["valid"][matrix_index],
                         self._beta_result,
                         np.uint64(entries),
                     ),
                 )
 
             self._dispatch_stage(
-                4, self._lane_groups, solve_second
+                4, self._lane_solve_tasks, solve_second
             )
 
             self._potrf_checked = True
@@ -1460,8 +1483,9 @@ class CudaStreamsBetaBackend(CudaHybridBetaBackend):
         task_word = "task" if self._factor_task_count == 1 else "tasks"
         return (
             "cuda-streams:%d (exact FP64; %d factorization %s, %d "
-            "auxiliary %s; %d independently scheduled factor %s; "
-            "fused assembly/perturb/scatter; %d regular and %d batched "
+            "auxiliary %s; %d independently scheduled factor %s and "
+            "%d matrix solve tasks; fused assembly/perturb/scatter; "
+            "%d regular and %d batched "
             "matrices; %.1f MiB static resident)" %
             (
                 self._device.id,
@@ -1471,6 +1495,7 @@ class CudaStreamsBetaBackend(CudaHybridBetaBackend):
                 auxiliary_word,
                 self._factor_task_count,
                 task_word,
+                self._solve_task_count,
                 self._unbatched_matrices,
                 self._batched_matrices,
                 self._resident_bytes / (1024.0 * 1024.0),
