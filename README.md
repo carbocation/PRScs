@@ -110,7 +110,7 @@ using GWAS summary statistics and an external LD reference panel.
 ## Using PRS-CS
 
 `
-python PRScs.py --ref_dir=PATH_TO_REFERENCE --bim_prefix=VALIDATION_BIM_PREFIX --sst_file=SUM_STATS_FILE --n_gwas=GWAS_SAMPLE_SIZE --out_dir=OUTPUT_DIR [--a=PARAM_A --b=PARAM_B --phi=PARAM_PHI --n_iter=MCMC_ITERATIONS --n_burnin=MCMC_BURNIN --thin=MCMC_THINNING_FACTOR --chrom=CHROM --beta_std=BETA_STD --write_psi=WRITE_PSI --write_pst=WRITE_POSTERIOR_SAMPLES --seed=SEED --backend=cpu|cuda|cuda-direct|cuda-hybrid|cuda-streams|cuda-fp32|cuda-fp32-streams|cuda-pcg --cuda_device=DEVICE --cuda_bucket_size=SIZE --cuda_streams=STREAMS --pcg_tol=TOL --pcg_maxiter=ITERATIONS --pcg_check_interval=ITERATIONS --ld_diagnostics=TRUE|FALSE --ld_rank_tol=TOL --psi_backend=cpu|cuda|cuda-raw|cuda-fused --cuda_gig_max_rounds=ROUNDS --profile=TRUE|FALSE]
+python PRScs.py --ref_dir=PATH_TO_REFERENCE --bim_prefix=VALIDATION_BIM_PREFIX --sst_file=SUM_STATS_FILE --n_gwas=GWAS_SAMPLE_SIZE --out_dir=OUTPUT_DIR [--a=PARAM_A --b=PARAM_B --phi=PARAM_PHI --n_iter=MCMC_ITERATIONS --n_burnin=MCMC_BURNIN --thin=MCMC_THINNING_FACTOR --chrom=CHROM --beta_std=BETA_STD --write_psi=WRITE_PSI --write_pst=WRITE_POSTERIOR_SAMPLES --seed=SEED --backend=cpu|cuda|cuda-direct|cuda-hybrid|cuda-streams|cuda-adaptive|cuda-fp32|cuda-fp32-streams|cuda-pcg --cuda_device=DEVICE --cuda_bucket_size=SIZE --cuda_streams=STREAMS --pcg_tol=TOL --pcg_maxiter=ITERATIONS --pcg_check_interval=ITERATIONS --ld_diagnostics=TRUE|FALSE --ld_rank_tol=TOL --psi_backend=cpu|cuda|cuda-raw|cuda-fused --cuda_gig_max_rounds=ROUNDS --profile=TRUE|FALSE]
 `
  - PATH_TO_REFERENCE (required): Full path (including folder name) to the directory that contains information on the LD reference panel (the snpinfo file and hdf5 files). If the 1000 Genomes reference panel is used, folder name would be `ldblk_1kg_afr`, `ldblk_1kg_amr`, `ldblk_1kg_eas`, `ldblk_1kg_eur` or `ldblk_1kg_sas`; if the UK Biobank reference panel is used, folder name would be `ldblk_ukbb_afr`, `ldblk_ukbb_amr`, `ldblk_ukbb_eas`, `ldblk_ukbb_eur` or `ldblk_ukbb_sas`. Note that the reference panel should match the ancestry of the GWAS sample (not the target sample).
 
@@ -180,7 +180,7 @@ where SNP is the rs ID, A1 is the effect allele, A2 is the alternative allele, B
 
 - SEED (optional): Non-negative integer which seeds the random number generator.
 
-- BACKEND (optional): Backend for the within-chromosome beta block update. `cpu` uses SciPy and is the default. `cuda` uses batched FP64 Cholesky through CuPy. `cuda-direct` invokes FP64 batched cuSOLVER and cuBLAS routines with preallocated workspaces. `cuda-hybrid` selects regular or batched FP64 routines according to bucket occupancy. `cuda-streams` additionally overlaps independent buckets on multiple CUDA streams. `cuda-fp32-streams` applies the same stream schedule and fused kernels using deliberately approximate FP32 state. `cuda-pcg` uses experimental FP64 perturb-and-solve with batched preconditioned conjugate gradients. This option does not change how chromosomes are scheduled.
+- BACKEND (optional): Backend for the within-chromosome beta block update. `cpu` uses SciPy and is the default. `cuda` uses batched FP64 Cholesky through CuPy. `cuda-direct` invokes FP64 batched cuSOLVER and cuBLAS routines with preallocated workspaces. `cuda-hybrid` selects regular or batched FP64 routines according to bucket occupancy. `cuda-streams` additionally overlaps independent buckets on multiple CUDA streams. `cuda-adaptive` sorts LD blocks by size and forms dense, low-padding batches before applying the exact stream path. `cuda-fp32-streams` applies the same stream schedule and fused kernels using deliberately approximate FP32 state. `cuda-pcg` uses experimental FP64 perturb-and-solve with batched preconditioned conjugate gradients. This option does not change how chromosomes are scheduled.
 
 - DEVICE (optional): Zero-based CUDA device number. Default is 0.
 
@@ -255,6 +255,12 @@ Dense buckets retain batched Cholesky, but their one-right-hand-side triangular 
 
 ```
 python PRScs.py ... --chrom=22 --backend=cuda-streams --cuda_streams=4 --psi_backend=cuda-fused --profile=True
+```
+
+`cuda-adaptive` replaces fixed-width grouping with an exact dynamic partition of blocks sorted by size. It creates the maximum number of groups containing at least eight matrices, then selects group boundaries that minimize estimated padded cubic work. `--cuda_bucket_size` remains the matrix-dimension alignment increment, normally 32:
+
+```
+python PRScs.py ... --chrom=22 --backend=cuda-adaptive --cuda_bucket_size=32 --cuda_streams=20 --psi_backend=cuda-fused --profile=True
 ```
 
 `cuda-fp32` is a deliberately approximate, opt-in version of the direct backend. It stores the LD matrices and MCMC linear-algebra state in FP32 and calls `spotrfBatched` and `strsmBatched`. This halves static matrix storage and can improve throughput, but it does not preserve FP64 rounding or exactly reproduce the FP64 transition. Validate posterior summaries for the intended reference panel and parameters before using its output:

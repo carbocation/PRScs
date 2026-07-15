@@ -20,7 +20,8 @@ def parse_args():
         "--backends", default="cpu,cuda,cuda-direct,cuda-pcg",
         help=(
             "comma-separated subset of cpu,cuda,cuda-direct,cuda-hybrid,"
-            "cuda-streams,cuda-fp32,cuda-fp32-streams,cuda-pcg"
+            "cuda-streams,cuda-adaptive,cuda-fp32,cuda-fp32-streams,"
+            "cuda-pcg"
         ),
     )
     parser.add_argument("--block-size", type=int, default=400)
@@ -46,7 +47,7 @@ def parse_args():
 def validate_args(args):
     allowed = {
         "cpu", "cuda", "cuda-direct", "cuda-hybrid", "cuda-streams",
-        "cuda-fp32", "cuda-fp32-streams", "cuda-pcg",
+        "cuda-adaptive", "cuda-fp32", "cuda-fp32-streams", "cuda-pcg",
     }
     backends = [value.strip() for value in args.backends.split(",")]
     unknown = set(backends) - allowed

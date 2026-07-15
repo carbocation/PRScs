@@ -222,7 +222,78 @@ def _block_layout(ld_blocks, block_sizes, p):
     return layout
 
 
-def ld_layout_diagnostics(block_sizes, bucket_size=32):
+def _fixed_block_groups(layout, bucket_size):
+    """Group blocks by a fixed padded-size interval."""
+    buckets = {}
+    for block_index, block_slice in layout:
+        size = block_slice.stop - block_slice.start
+        padded_size = (
+            (size + bucket_size - 1) // bucket_size
+        ) * bucket_size
+        buckets.setdefault(padded_size, []).append(
+            (block_index, block_slice)
+        )
+    return sorted(buckets.items())
+
+
+def _adaptive_block_groups(layout, bucket_size, minimum_count=8):
+    """Partition sorted blocks into dense, low-padding size clusters."""
+    if len(layout) < minimum_count:
+        return _fixed_block_groups(layout, bucket_size)
+
+    ordered = sorted(
+        layout, key=lambda item: item[1].stop - item[1].start
+    )
+    item_count = len(ordered)
+    group_count = item_count // minimum_count
+    infinity = float("inf")
+    costs = np.full((group_count + 1, item_count + 1), infinity)
+    parents = np.full(
+        (group_count + 1, item_count + 1), -1, dtype=np.int64
+    )
+    costs[0, 0] = 0.0
+
+    for groups_used in range(1, group_count + 1):
+        minimum_end = groups_used * minimum_count
+        maximum_end = (
+            item_count - (group_count - groups_used) * minimum_count
+        )
+        for end in range(minimum_end, maximum_end + 1):
+            size = ordered[end - 1][1].stop - ordered[end - 1][1].start
+            padded_size = (
+                (size + bucket_size - 1) // bucket_size
+            ) * bucket_size
+            minimum_start = (groups_used - 1) * minimum_count
+            maximum_start = end - minimum_count
+            for start in range(minimum_start, maximum_start + 1):
+                previous = costs[groups_used - 1, start]
+                if not np.isfinite(previous):
+                    continue
+                candidate = previous + (
+                    (end - start) * float(padded_size) ** 3
+                )
+                if candidate < costs[groups_used, end]:
+                    costs[groups_used, end] = candidate
+                    parents[groups_used, end] = start
+
+    groups = []
+    end = item_count
+    for groups_used in range(group_count, 0, -1):
+        start = int(parents[groups_used, end])
+        if start < 0:
+            raise RuntimeError("adaptive CUDA block partitioning failed")
+        blocks = ordered[start:end]
+        size = blocks[-1][1].stop - blocks[-1][1].start
+        padded_size = (
+            (size + bucket_size - 1) // bucket_size
+        ) * bucket_size
+        groups.append((padded_size, blocks))
+        end = start
+    groups.reverse()
+    return groups
+
+
+def ld_layout_diagnostics(block_sizes, bucket_size=32, adaptive=False):
     """Return cheap size and padding diagnostics for an LD block layout."""
     bucket_size = int(bucket_size)
     if bucket_size < 1:
@@ -241,7 +312,25 @@ def ld_layout_diagnostics(block_sizes, bucket_size=32):
             "padding_cubic_ratio": 1.0,
         }
 
-    padded = ((sizes + bucket_size - 1) // bucket_size) * bucket_size
+    start = 0
+    layout = []
+    for block_index, size in enumerate(block_sizes):
+        size = int(size)
+        if size > 0:
+            layout.append((block_index, slice(start, start + size)))
+        start += max(size, 0)
+    if adaptive:
+        groups = _adaptive_block_groups(layout, bucket_size)
+    else:
+        groups = _fixed_block_groups(layout, bucket_size)
+    padded_memory = sum(
+        len(blocks) * float(padded_size) ** 2
+        for padded_size, blocks in groups
+    )
+    padded_cubic = sum(
+        len(blocks) * float(padded_size) ** 3
+        for padded_size, blocks in groups
+    )
     return {
         "active_blocks": int(sizes.size),
         "variants": int(sizes.sum()),
@@ -250,24 +339,27 @@ def ld_layout_diagnostics(block_sizes, bucket_size=32):
         "size_p90": float(np.percentile(sizes, 90)),
         "size_max": int(sizes.max()),
         "padding_memory_ratio": float(
-            np.sum(padded.astype(np.float64) ** 2) /
+            padded_memory /
             np.sum(sizes.astype(np.float64) ** 2)
         ),
         "padding_cubic_ratio": float(
-            np.sum(padded.astype(np.float64) ** 3) /
+            padded_cubic /
             np.sum(sizes.astype(np.float64) ** 3)
         ),
     }
 
 
 def diagnose_ld_blocks(ld_blocks, block_sizes, bucket_size=32,
-                       rank_rtol=1e-8, ld_eigenvalues=None):
+                       rank_rtol=1e-8, ld_eigenvalues=None,
+                       adaptive=False):
     """Measure padding, definiteness and numerical rank of real LD blocks."""
     rank_rtol = float(rank_rtol)
     if not 0.0 <= rank_rtol < 1.0:
         raise ValueError("rank_rtol must be in [0, 1)")
 
-    diagnostics = ld_layout_diagnostics(block_sizes, bucket_size)
+    diagnostics = ld_layout_diagnostics(
+        block_sizes, bucket_size, adaptive=adaptive
+    )
     if (ld_eigenvalues is not None and
             len(ld_eigenvalues) != len(ld_blocks)):
         raise ValueError(
@@ -494,14 +586,7 @@ class CudaBetaBackend:
         beta_mrg = np.asarray(beta_mrg, dtype=np.float64).reshape(-1, 1)
         self._p = beta_mrg.shape[0]
         layout = _block_layout(ld_blocks, block_sizes, self._p)
-
-        buckets = {}
-        for block_index, block_slice in layout:
-            size = block_slice.stop - block_slice.start
-            padded_size = ((size + bucket_size - 1) // bucket_size) * bucket_size
-            buckets.setdefault(padded_size, []).append(
-                (block_index, block_slice)
-            )
+        block_groups = self._make_block_groups(layout)
 
         self._groups = []
         self._resident_bytes = 0
@@ -515,7 +600,7 @@ class CudaBetaBackend:
                 int(self._beta_result.nbytes) + int(self._psi_device.nbytes)
             )
 
-            for padded_size, blocks in sorted(buckets.items()):
+            for padded_size, blocks in block_groups:
                 count = len(blocks)
                 host_ld = np.zeros(
                     (count, padded_size, padded_size),
@@ -554,6 +639,9 @@ class CudaBetaBackend:
                     int(value.nbytes) for value in group.values()
                 )
                 self._groups.append(group)
+
+    def _make_block_groups(self, layout):
+        return _fixed_block_groups(layout, self._bucket_size)
 
     def sample(self, psi, sigma):
         """Draw beta on CUDA, copying only O(p) state per iteration."""
@@ -1508,6 +1596,60 @@ class CudaStreamsBetaBackend(CudaHybridBetaBackend):
         )
 
 
+class CudaAdaptiveStreamsBetaBackend(CudaStreamsBetaBackend):
+    """Exact stream backend clustering sorted blocks into dense batches."""
+
+    name = "cuda-adaptive"
+
+    def _make_block_groups(self, layout):
+        groups = _adaptive_block_groups(
+            layout, self._bucket_size, self._minimum_batched_count
+        )
+        unpadded_memory = sum(
+            float(block_slice.stop - block_slice.start) ** 2
+            for _, block_slice in layout
+        )
+        unpadded_cubic = sum(
+            float(block_slice.stop - block_slice.start) ** 3
+            for _, block_slice in layout
+        )
+        padded_memory = sum(
+            len(blocks) * float(padded_size) ** 2
+            for padded_size, blocks in groups
+        )
+        padded_cubic = sum(
+            len(blocks) * float(padded_size) ** 3
+            for padded_size, blocks in groups
+        )
+        self._adaptive_padding_memory = (
+            padded_memory / unpadded_memory if unpadded_memory else 1.0
+        )
+        self._adaptive_padding_cubic = (
+            padded_cubic / unpadded_cubic if unpadded_cubic else 1.0
+        )
+        self._adaptive_group_count = len(groups)
+        return groups
+
+    def describe(self):
+        return super().describe().replace(
+            "cuda-streams", "cuda-adaptive", 1
+        ).replace(
+            "exact FP64;",
+            "exact FP64; %d adaptive size clusters, padding %.3fx/%.3fx "
+            "memory/cubic;" % (
+                self._adaptive_group_count,
+                self._adaptive_padding_memory,
+                self._adaptive_padding_cubic,
+            ),
+            1,
+        )
+
+    def profile_summary(self):
+        return super().profile_summary().replace(
+            "CUDA streams", "CUDA adaptive", 1
+        )
+
+
 class CudaFp32StreamsBetaBackend(CudaStreamsBetaBackend):
     """Approximate FP32 version of the matrix-stream backend."""
 
@@ -1972,6 +2114,8 @@ def make_beta_backend(backend, ld_blocks, block_sizes, beta_mrg, n_gwas,
         return CudaHybridBetaBackend(**kwargs)
     if backend == "cuda-streams":
         return CudaStreamsBetaBackend(**kwargs)
+    if backend == "cuda-adaptive":
+        return CudaAdaptiveStreamsBetaBackend(**kwargs)
     if backend == "cuda-fp32-streams":
         return CudaFp32StreamsBetaBackend(**kwargs)
     if backend == "cuda-fp32":
@@ -1980,6 +2124,6 @@ def make_beta_backend(backend, ld_blocks, block_sizes, beta_mrg, n_gwas,
         return CudaPcgBetaBackend(**kwargs)
     raise ValueError(
         "unknown beta backend %r; expected 'cpu', 'cuda', 'cuda-direct', "
-        "'cuda-hybrid', 'cuda-streams', 'cuda-fp32', "
+        "'cuda-hybrid', 'cuda-streams', 'cuda-adaptive', 'cuda-fp32', "
         "'cuda-fp32-streams' or 'cuda-pcg'" % backend
     )
