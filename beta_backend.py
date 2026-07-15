@@ -8,6 +8,8 @@ import weakref
 
 import numpy as np
 from scipy import linalg
+from scipy.linalg.blas import dtrsv
+from scipy.linalg.lapack import dpotrf
 
 
 def _destroy_stream_handles(cublas, cusolver, cublas_handles,
@@ -461,18 +463,36 @@ class CpuBetaBackend:
     name = "cpu"
 
     def __init__(self, ld_blocks, block_sizes, beta_mrg, n_gwas, **_kwargs):
-        self._ld_blocks = ld_blocks
         self._beta_mrg = np.asarray(beta_mrg, dtype=np.float64).reshape(-1, 1)
         self._n_gwas = int(n_gwas)
         self._layout = _block_layout(
             ld_blocks, block_sizes, self._beta_mrg.shape[0]
         )
         self._beta = np.empty_like(self._beta_mrg)
-        self._work = {
-            block_index: np.empty(np.shape(ld_blocks[block_index]),
-                                  dtype=np.float64, order="F")
+        # LAPACK consumes column-major matrices.  Keeping the pristine LD
+        # sources in the same order makes each per-iteration copy contiguous
+        # instead of transposing through memory into the factor workspace.
+        self._ld_blocks = {
+            block_index: np.asfortranarray(
+                ld_blocks[block_index], dtype=np.float64
+            )
             for block_index, _ in self._layout
         }
+        self._work = {
+            block_index: np.empty_like(
+                self._ld_blocks[block_index], order="F"
+            )
+            for block_index, _ in self._layout
+        }
+        maximum_size = max(
+            (
+                block_slice.stop - block_slice.start
+                for _, block_slice in self._layout
+            ),
+            default=0,
+        )
+        self._rhs = np.empty(maximum_size, dtype=np.float64)
+        self._inverse_psi = np.empty(maximum_size, dtype=np.float64)
 
     def sample(self, psi, sigma):
         """Draw beta for every non-empty LD block and return (beta, quad)."""
@@ -487,41 +507,52 @@ class CpuBetaBackend:
             size = block_slice.stop - block_slice.start
             precision = self._work[block_index]
             np.copyto(precision, self._ld_blocks[block_index])
-            diag = np.diag_indices(size)
-            precision[diag] += 1.0 / psi[block_slice]
+            inverse_psi = self._inverse_psi[:size]
+            np.reciprocal(psi[block_slice], out=inverse_psi)
+            diagonal = precision.ravel(order="K")[::size + 1]
+            np.add(diagonal, inverse_psi, out=diagonal)
 
-            # SciPy returns U with A = U.T @ U when lower=False.
-            chol = linalg.cholesky(
-                precision,
-                lower=False,
-                overwrite_a=True,
-                check_finite=False,
+            # dpotrf returns U with A = U.T @ U.  clean=0 avoids clearing the
+            # unused lower triangle, which neither dtrsv call reads.
+            chol, info = dpotrf(
+                precision, lower=0, overwrite_a=1, clean=0
             )
-            beta_tmp = linalg.solve_triangular(
-                chol,
-                self._beta_mrg[block_slice],
-                trans="T",
-                lower=False,
-                check_finite=False,
-            )
-            beta_tmp += sd * np.random.standard_normal((size, 1))
-            self._beta[block_slice] = linalg.solve_triangular(
-                chol,
-                beta_tmp,
-                trans="N",
-                lower=False,
-                check_finite=False,
-            )
+            if info < 0:
+                raise ValueError(
+                    "CPU Cholesky received an invalid LAPACK argument %d "
+                    "for LD block %d" % (-info, block_index)
+                )
+            if info > 0:
+                raise np.linalg.LinAlgError(
+                    "CPU Cholesky failed for LD block %d: leading minor %d "
+                    "is not positive definite" % (block_index, info)
+                )
 
-            # A = U.T @ U and U @ beta = beta_tmp, hence
-            # beta.T @ A @ beta = ||beta_tmp||^2. This avoids a dense
-            # matrix-vector product that the original implementation did.
-            quad += float(np.dot(beta_tmp[:, 0], beta_tmp[:, 0]))
+            rhs = self._rhs[:size]
+            np.copyto(rhs, self._beta_mrg[block_slice, 0])
+            rhs = dtrsv(
+                chol, rhs, lower=0, trans=1, diag=0, overwrite_x=1
+            )
+            rhs += sd * np.random.standard_normal(size)
+
+            # A = U.T @ U and U @ beta = rhs, hence
+            # beta.T @ A @ beta = ||rhs||^2.
+            quad += float(np.dot(rhs, rhs))
+
+            beta_block = self._beta[block_slice, 0]
+            np.copyto(beta_block, rhs)
+            solved = dtrsv(
+                chol, beta_block, lower=0, trans=0, diag=0, overwrite_x=1
+            )
+            if solved is not beta_block:
+                np.copyto(beta_block, solved)
 
         return self._beta, quad
 
     def describe(self):
-        return "cpu (SciPy Cholesky; %d active LD blocks)" % len(self._layout)
+        return "cpu (direct FP64 LAPACK/BLAS; %d active LD blocks)" % len(
+            self._layout
+        )
 
 
 class CudaBetaBackend:

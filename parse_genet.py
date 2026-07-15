@@ -23,8 +23,8 @@ def _project_ld_psd(ld):
         symmetric_ld, check_finite=False
     )
     eigenvalues = np.maximum(eigenvalues, 0.0)
-    projected = np.dot(
-        eigenvectors * eigenvalues[None, :], eigenvectors.T
+    projected = np.asfortranarray(
+        np.dot(eigenvectors * eigenvalues[None, :], eigenvectors.T)
     )
     factor = eigenvectors * np.sqrt(eigenvalues)[None, :]
     return projected, factor, eigenvalues

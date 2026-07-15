@@ -97,6 +97,48 @@ class CpuBetaBackendTests(unittest.TestCase):
                                    atol=1e-12)
         self.assertAlmostEqual(actual_quad, expected_quad, places=12)
 
+    def test_reuses_workspaces_without_mutating_ld_sources(self):
+        blocks, sizes, beta_mrg, psi = _inputs()
+        original_blocks = [block.copy() for block in blocks]
+        backend = CpuBetaBackend(blocks, sizes, beta_mrg, 1000)
+
+        np.random.seed(456)
+        first_beta, first_quad = backend.sample(psi, 0.7)
+        first_beta = first_beta.copy()
+        np.random.seed(789)
+        second_beta, second_quad = backend.sample(psi, 0.9)
+        second_beta = second_beta.copy()
+
+        np.random.seed(456)
+        expected_first_beta, expected_first_quad = _legacy_sample(
+            blocks, sizes, beta_mrg, psi, 0.7, 1000
+        )
+        np.random.seed(789)
+        expected_second_beta, expected_second_quad = _legacy_sample(
+            blocks, sizes, beta_mrg, psi, 0.9, 1000
+        )
+
+        np.testing.assert_allclose(
+            first_beta, expected_first_beta, rtol=1e-12, atol=1e-12
+        )
+        np.testing.assert_allclose(
+            second_beta, expected_second_beta, rtol=1e-12, atol=1e-12
+        )
+        self.assertAlmostEqual(first_quad, expected_first_quad, places=12)
+        self.assertAlmostEqual(second_quad, expected_second_quad, places=12)
+        for actual, original in zip(blocks, original_blocks):
+            np.testing.assert_array_equal(actual, original)
+        for source in backend._ld_blocks.values():
+            self.assertTrue(source.flags.f_contiguous)
+
+    def test_reports_cholesky_failure(self):
+        backend = CpuBetaBackend(
+            [-2.0 * np.eye(2)], [2], np.ones((2, 1)), 1000
+        )
+        with self.assertRaisesRegex(
+                np.linalg.LinAlgError, "CPU Cholesky failed for LD block 0"):
+            backend.sample(np.ones((2, 1)), 1.0)
+
     def test_rejects_inconsistent_layout(self):
         blocks, sizes, beta_mrg, _ = _inputs()
         sizes = list(sizes)
@@ -160,6 +202,7 @@ class CpuBetaBackendTests(unittest.TestCase):
             matrix + right.T @ np.diag(singular_values) @ right
         ) / 2.0
         projected, factor, eigenvalues = _project_ld_psd(matrix)
+        self.assertTrue(projected.flags.f_contiguous)
         np.testing.assert_allclose(projected, legacy, rtol=1e-12,
                                    atol=1e-12)
         np.testing.assert_allclose(factor @ factor.T, projected,
