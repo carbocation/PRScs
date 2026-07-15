@@ -107,6 +107,90 @@ void scatter_beta(
         beta[indices[offset]] = rhs[offset];
     }
 }
+
+extern "C" __global__
+void assemble_precision_f32(
+        const float* ld,
+        const long long* indices,
+        const unsigned char* valid,
+        const float* psi,
+        float* precision,
+        const unsigned long long entries,
+        const int size) {
+    const unsigned long long offset =
+        (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (offset >= entries) return;
+
+    const int column = (int)(offset % (unsigned long long)size);
+    const int row = (int)(
+        (offset / (unsigned long long)size) % (unsigned long long)size
+    );
+    float value = ld[offset];
+    if (row == column) {
+        const unsigned long long matrix = offset /
+            ((unsigned long long)size * (unsigned long long)size);
+        const unsigned long long vector_offset =
+            matrix * (unsigned long long)size + (unsigned long long)row;
+        if (valid[vector_offset]) {
+            value += 1.0f / psi[indices[vector_offset]];
+        }
+    }
+    precision[offset] = value;
+}
+
+extern "C" __global__
+void perturb_quad_f32(
+        float* rhs,
+        const long long* indices,
+        const unsigned char* valid,
+        const float* noise,
+        const float sd,
+        float* quad,
+        const int size) {
+    extern __shared__ float partial_f32[];
+    const int matrix = blockIdx.x;
+    const unsigned long long base =
+        (unsigned long long)matrix * (unsigned long long)size;
+    float sum = 0.0f;
+
+    for (int row = threadIdx.x; row < size; row += blockDim.x) {
+        const unsigned long long offset = base + (unsigned long long)row;
+        float value = rhs[offset];
+        if (valid[offset]) {
+            value += sd * noise[indices[offset]];
+        }
+        rhs[offset] = value;
+        sum += value * value;
+    }
+
+    partial_f32[threadIdx.x] = sum;
+    __syncthreads();
+    for (int stride = blockDim.x / 2; stride > 0; stride /= 2) {
+        if (threadIdx.x < stride) {
+            partial_f32[threadIdx.x] += partial_f32[
+                threadIdx.x + stride
+            ];
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) {
+        quad[matrix] = partial_f32[0];
+    }
+}
+
+extern "C" __global__
+void scatter_beta_f32(
+        const float* rhs,
+        const long long* indices,
+        const unsigned char* valid,
+        float* beta,
+        const unsigned long long entries) {
+    const unsigned long long offset =
+        (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (offset < entries && valid[offset]) {
+        beta[indices[offset]] = rhs[offset];
+    }
+}
 """
 
 
@@ -1103,17 +1187,26 @@ class CudaStreamsBetaBackend(CudaHybridBetaBackend):
                     code=_CUDA_STREAM_KERNEL_SOURCE,
                     options=("--std=c++11",),
                 )
+                suffix = (
+                    "_f32" if self._host_dtype == np.dtype(np.float32)
+                    else ""
+                )
                 self._assemble_precision_kernel = (
                     self._stream_kernel_module.get_function(
-                        "assemble_precision"
+                        "assemble_precision" + suffix
                     )
                 )
                 self._scatter_beta_kernel = (
-                    self._stream_kernel_module.get_function("scatter_beta")
+                    self._stream_kernel_module.get_function(
+                        "scatter_beta" + suffix
+                    )
                 )
                 self._perturb_quad_kernel = (
-                    self._stream_kernel_module.get_function("perturb_quad")
+                    self._stream_kernel_module.get_function(
+                        "perturb_quad" + suffix
+                    )
                 )
+                self._kernel_scalar_type = self._host_dtype.type
                 self._kernel_threads = 256
                 self._streams = [
                     cp.cuda.Stream(non_blocking=True)
@@ -1298,12 +1391,12 @@ class CudaStreamsBetaBackend(CudaHybridBetaBackend):
                         group["indices"],
                         group["valid"],
                         noise,
-                        np.float64(sd),
+                        self._kernel_scalar_type(sd),
                         group["quad_results"],
                         np.int32(group["precision"].shape[-1]),
                     ),
                     shared_mem=(
-                        self._kernel_threads * np.dtype(np.float64).itemsize
+                        self._kernel_threads * self._host_dtype.itemsize
                     ),
                 )
 
@@ -1387,6 +1480,26 @@ class CudaStreamsBetaBackend(CudaHybridBetaBackend):
     def profile_summary(self):
         return super().profile_summary().replace(
             "CUDA hybrid", "CUDA streams", 1
+        )
+
+
+class CudaFp32StreamsBetaBackend(CudaStreamsBetaBackend):
+    """Approximate FP32 version of the matrix-stream backend."""
+
+    name = "cuda-fp32-streams"
+
+    def __init__(self, *args, **kwargs):
+        kwargs["_cuda_dtype"] = np.float32
+        super().__init__(*args, **kwargs)
+
+    def describe(self):
+        return super().describe().replace(
+            "cuda-streams", "cuda-fp32-streams", 1
+        ).replace("exact FP64", "approximate FP32", 1)
+
+    def profile_summary(self):
+        return super().profile_summary().replace(
+            "CUDA streams", "CUDA FP32 streams", 1
         )
 
 
@@ -1834,11 +1947,14 @@ def make_beta_backend(backend, ld_blocks, block_sizes, beta_mrg, n_gwas,
         return CudaHybridBetaBackend(**kwargs)
     if backend == "cuda-streams":
         return CudaStreamsBetaBackend(**kwargs)
+    if backend == "cuda-fp32-streams":
+        return CudaFp32StreamsBetaBackend(**kwargs)
     if backend == "cuda-fp32":
         return CudaFp32BetaBackend(**kwargs)
     if backend == "cuda-pcg":
         return CudaPcgBetaBackend(**kwargs)
     raise ValueError(
         "unknown beta backend %r; expected 'cpu', 'cuda', 'cuda-direct', "
-        "'cuda-hybrid', 'cuda-streams', 'cuda-fp32' or 'cuda-pcg'" % backend
+        "'cuda-hybrid', 'cuda-streams', 'cuda-fp32', "
+        "'cuda-fp32-streams' or 'cuda-pcg'" % backend
     )

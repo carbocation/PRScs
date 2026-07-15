@@ -110,7 +110,7 @@ using GWAS summary statistics and an external LD reference panel.
 ## Using PRS-CS
 
 `
-python PRScs.py --ref_dir=PATH_TO_REFERENCE --bim_prefix=VALIDATION_BIM_PREFIX --sst_file=SUM_STATS_FILE --n_gwas=GWAS_SAMPLE_SIZE --out_dir=OUTPUT_DIR [--a=PARAM_A --b=PARAM_B --phi=PARAM_PHI --n_iter=MCMC_ITERATIONS --n_burnin=MCMC_BURNIN --thin=MCMC_THINNING_FACTOR --chrom=CHROM --beta_std=BETA_STD --write_psi=WRITE_PSI --write_pst=WRITE_POSTERIOR_SAMPLES --seed=SEED --backend=cpu|cuda|cuda-direct|cuda-hybrid|cuda-streams|cuda-fp32|cuda-pcg --cuda_device=DEVICE --cuda_bucket_size=SIZE --cuda_streams=STREAMS --pcg_tol=TOL --pcg_maxiter=ITERATIONS --pcg_check_interval=ITERATIONS --ld_diagnostics=TRUE|FALSE --ld_rank_tol=TOL --psi_backend=cpu|cuda|cuda-raw|cuda-fused --cuda_gig_max_rounds=ROUNDS --profile=TRUE|FALSE]
+python PRScs.py --ref_dir=PATH_TO_REFERENCE --bim_prefix=VALIDATION_BIM_PREFIX --sst_file=SUM_STATS_FILE --n_gwas=GWAS_SAMPLE_SIZE --out_dir=OUTPUT_DIR [--a=PARAM_A --b=PARAM_B --phi=PARAM_PHI --n_iter=MCMC_ITERATIONS --n_burnin=MCMC_BURNIN --thin=MCMC_THINNING_FACTOR --chrom=CHROM --beta_std=BETA_STD --write_psi=WRITE_PSI --write_pst=WRITE_POSTERIOR_SAMPLES --seed=SEED --backend=cpu|cuda|cuda-direct|cuda-hybrid|cuda-streams|cuda-fp32|cuda-fp32-streams|cuda-pcg --cuda_device=DEVICE --cuda_bucket_size=SIZE --cuda_streams=STREAMS --pcg_tol=TOL --pcg_maxiter=ITERATIONS --pcg_check_interval=ITERATIONS --ld_diagnostics=TRUE|FALSE --ld_rank_tol=TOL --psi_backend=cpu|cuda|cuda-raw|cuda-fused --cuda_gig_max_rounds=ROUNDS --profile=TRUE|FALSE]
 `
  - PATH_TO_REFERENCE (required): Full path (including folder name) to the directory that contains information on the LD reference panel (the snpinfo file and hdf5 files). If the 1000 Genomes reference panel is used, folder name would be `ldblk_1kg_afr`, `ldblk_1kg_amr`, `ldblk_1kg_eas`, `ldblk_1kg_eur` or `ldblk_1kg_sas`; if the UK Biobank reference panel is used, folder name would be `ldblk_ukbb_afr`, `ldblk_ukbb_amr`, `ldblk_ukbb_eas`, `ldblk_ukbb_eur` or `ldblk_ukbb_sas`. Note that the reference panel should match the ancestry of the GWAS sample (not the target sample).
 
@@ -180,7 +180,7 @@ where SNP is the rs ID, A1 is the effect allele, A2 is the alternative allele, B
 
 - SEED (optional): Non-negative integer which seeds the random number generator.
 
-- BACKEND (optional): Backend for the within-chromosome beta block update. `cpu` uses SciPy and is the default. `cuda` uses batched FP64 Cholesky through CuPy. `cuda-direct` invokes FP64 batched cuSOLVER and cuBLAS routines with preallocated workspaces. `cuda-hybrid` selects regular or batched FP64 routines according to bucket occupancy. `cuda-streams` additionally overlaps independent buckets on multiple CUDA streams. `cuda-pcg` uses experimental FP64 perturb-and-solve with batched preconditioned conjugate gradients. This option does not change how chromosomes are scheduled.
+- BACKEND (optional): Backend for the within-chromosome beta block update. `cpu` uses SciPy and is the default. `cuda` uses batched FP64 Cholesky through CuPy. `cuda-direct` invokes FP64 batched cuSOLVER and cuBLAS routines with preallocated workspaces. `cuda-hybrid` selects regular or batched FP64 routines according to bucket occupancy. `cuda-streams` additionally overlaps independent buckets on multiple CUDA streams. `cuda-fp32-streams` applies the same stream schedule and fused kernels using deliberately approximate FP32 state. `cuda-pcg` uses experimental FP64 perturb-and-solve with batched preconditioned conjugate gradients. This option does not change how chromosomes are scheduled.
 
 - DEVICE (optional): Zero-based CUDA device number. Default is 0.
 
@@ -261,6 +261,12 @@ python PRScs.py ... --chrom=22 --backend=cuda-streams --cuda_streams=4 --psi_bac
 python PRScs.py ... --chrom=22 --backend=cuda-fp32 --psi_backend=cuda-fused --profile=True
 ```
 
+`cuda-fp32-streams` combines that approximate FP32 state with the matrix-level factorization schedule and fused kernels from `cuda-streams`. It is intended only as an explicitly validated performance experiment; use `cuda-streams` when an exact FP64 transition is required:
+
+```
+python PRScs.py ... --chrom=22 --backend=cuda-fp32-streams --cuda_streams=20 --psi_backend=cuda-fused --profile=True
+```
+
 `cuda-pcg` draws an exact Gaussian perturbation and solves the resulting precision systems with diagonally preconditioned FP64 conjugate gradients:
 
 ```
@@ -301,7 +307,7 @@ Run the self-contained 40,000-variant benchmark with:
 python3 benchmark_gpu.py
 ```
 
-The default comparison runs `cpu`, `cuda`, `cuda-direct`, and `cuda-pcg`. Use, for example, `--backends=cuda-hybrid,cuda-streams --cuda-streams=4 --n-iter=100` to measure stream overlap, or `--backends=cuda-streams,cuda-fp32 --n-iter=100` for an exact-FP64-versus-FP32 comparison. Add `--psi-backend=cuda` to benchmark the vectorized CUDA GIG update, `--psi-backend=cuda-raw` for the single-kernel GIG implementation, or `--psi-backend=cuda-fused` to include `delta` generation in that kernel. The benchmark does not install or modify CUDA packages or drivers.
+The default comparison runs `cpu`, `cuda`, `cuda-direct`, and `cuda-pcg`. Use, for example, `--backends=cuda-hybrid,cuda-streams --cuda-streams=4 --n-iter=100` to measure stream overlap, or `--backends=cuda-streams,cuda-fp32-streams --cuda-streams=20 --n-iter=100` for an exact-FP64-versus-approximate-FP32 comparison. Add `--psi-backend=cuda` to benchmark the vectorized CUDA GIG update, `--psi-backend=cuda-raw` for the single-kernel GIG implementation, or `--psi-backend=cuda-fused` to include `delta` generation in that kernel. The benchmark does not install or modify CUDA packages or drivers.
 
 
 ## Test Data

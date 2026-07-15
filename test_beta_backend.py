@@ -16,6 +16,7 @@ from beta_backend import (
     CudaBetaBackend,
     CudaDirectBetaBackend,
     CudaFp32BetaBackend,
+    CudaFp32StreamsBetaBackend,
     CudaHybridBetaBackend,
     CudaPcgBetaBackend,
     CudaStreamsBetaBackend,
@@ -404,6 +405,63 @@ class CudaBetaBackendTests(unittest.TestCase):
             quad / expected_quad, 1.0, places=5
         )
         self.assertIn("approximate", backend.describe())
+
+    def test_fp32_stream_backend_tracks_analytic_conditional_mean(self):
+        blocks, sizes, beta_mrg, psi = _inputs()
+        backend = CudaFp32StreamsBetaBackend(
+            blocks,
+            sizes,
+            beta_mrg,
+            1000,
+            seed=123,
+            cuda_bucket_size=4,
+            cuda_streams=2,
+        )
+        beta, quad = backend.sample(psi, 0.0)
+
+        expected_beta = np.empty_like(beta_mrg)
+        expected_quad = 0.0
+        start = 0
+        for ld, size in zip(blocks, sizes):
+            if not size:
+                continue
+            block_slice = slice(start, start + size)
+            precision = ld + np.diag(1.0 / psi[block_slice, 0])
+            expected_beta[block_slice] = np.linalg.solve(
+                precision, beta_mrg[block_slice]
+            )
+            expected_quad += (
+                expected_beta[block_slice].T @ precision @
+                expected_beta[block_slice]
+            ).item()
+            start += size
+
+        np.testing.assert_allclose(
+            beta, expected_beta, rtol=2e-5, atol=2e-6
+        )
+        self.assertAlmostEqual(quad / expected_quad, 1.0, places=5)
+        self.assertIn("approximate FP32", backend.describe())
+
+    def test_fp32_stream_backend_is_seeded_reproducibly(self):
+        blocks, sizes, beta_mrg, psi = _inputs()
+        backends = [
+            CudaFp32StreamsBetaBackend(
+                blocks,
+                sizes,
+                beta_mrg,
+                1000,
+                seed=456,
+                cuda_bucket_size=4,
+                cuda_streams=2,
+            )
+            for _ in range(2)
+        ]
+
+        first_beta, first_quad = backends[0].sample(psi, 0.7)
+        second_beta, second_quad = backends[1].sample(psi, 0.7)
+
+        np.testing.assert_array_equal(first_beta, second_beta)
+        self.assertEqual(first_quad, second_quad)
 
     def test_fp32_backend_matches_conditional_moments(self):
         ld = np.array([[1.0, 0.25], [0.25, 0.8]])
