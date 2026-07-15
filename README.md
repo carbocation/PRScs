@@ -110,7 +110,7 @@ using GWAS summary statistics and an external LD reference panel.
 ## Using PRS-CS
 
 `
-python PRScs.py --ref_dir=PATH_TO_REFERENCE --bim_prefix=VALIDATION_BIM_PREFIX --sst_file=SUM_STATS_FILE --n_gwas=GWAS_SAMPLE_SIZE --out_dir=OUTPUT_DIR [--a=PARAM_A --b=PARAM_B --phi=PARAM_PHI --n_iter=MCMC_ITERATIONS --n_burnin=MCMC_BURNIN --thin=MCMC_THINNING_FACTOR --chrom=CHROM --beta_std=BETA_STD --write_psi=WRITE_PSI --write_pst=WRITE_POSTERIOR_SAMPLES --seed=SEED --backend=cpu|cuda|cuda-direct|cuda-hybrid|cuda-streams|cuda-adaptive|cuda-fp32|cuda-fp32-streams|cuda-pcg --cuda_device=DEVICE --cuda_bucket_size=SIZE --cuda_streams=STREAMS --pcg_tol=TOL --pcg_maxiter=ITERATIONS --pcg_check_interval=ITERATIONS --ld_diagnostics=TRUE|FALSE --ld_rank_tol=TOL --psi_backend=cpu|cuda|cuda-raw|cuda-fused --cuda_gig_max_rounds=ROUNDS --profile=TRUE|FALSE]
+python PRScs.py --ref_dir=PATH_TO_REFERENCE --bim_prefix=VALIDATION_BIM_PREFIX --sst_file=SUM_STATS_FILE --n_gwas=GWAS_SAMPLE_SIZE --out_dir=OUTPUT_DIR [--a=PARAM_A --b=PARAM_B --phi=PARAM_PHI --n_iter=MCMC_ITERATIONS --n_burnin=MCMC_BURNIN --thin=MCMC_THINNING_FACTOR --chrom=CHROM --joint_chromosomes=TRUE|FALSE --beta_std=BETA_STD --write_psi=WRITE_PSI --write_pst=WRITE_POSTERIOR_SAMPLES --seed=SEED --backend=cpu|cuda|cuda-direct|cuda-hybrid|cuda-streams|cuda-adaptive|cuda-fp32|cuda-fp32-streams|cuda-pcg --cuda_device=DEVICE --cuda_bucket_size=SIZE --cuda_streams=STREAMS --pcg_tol=TOL --pcg_maxiter=ITERATIONS --pcg_check_interval=ITERATIONS --ld_diagnostics=TRUE|FALSE --ld_rank_tol=TOL --psi_backend=cpu|cuda|cuda-raw|cuda-fused --cuda_gig_max_rounds=ROUNDS --profile=TRUE|FALSE]
 `
  - PATH_TO_REFERENCE (required): Full path (including folder name) to the directory that contains information on the LD reference panel (the snpinfo file and hdf5 files). If the 1000 Genomes reference panel is used, folder name would be `ldblk_1kg_afr`, `ldblk_1kg_amr`, `ldblk_1kg_eas`, `ldblk_1kg_eur` or `ldblk_1kg_sas`; if the UK Biobank reference panel is used, folder name would be `ldblk_ukbb_afr`, `ldblk_ukbb_amr`, `ldblk_ukbb_eas`, `ldblk_ukbb_eur` or `ldblk_ukbb_sas`. Note that the reference panel should match the ancestry of the GWAS sample (not the target sample).
 
@@ -200,7 +200,9 @@ where SNP is the rs ID, A1 is the effect allele, A2 is the alternative allele, B
 
 - ROUNDS (optional): Maximum vector rejection rounds for the CUDA GIG sampler. Default is 1000. The sampler fails explicitly instead of returning incomplete draws if this bound is reached.
 
-- PROFILE (optional): If True, report warm-up and steady-state mean time spent in the beta update, `psi` update and remaining within-chromosome work. The first iteration is excluded from steady-state means. Default is False.
+- JOINT_CHROMOSOMES (optional): If True, run one MCMC chain across all chromosomes selected by `--chrom`. The chain uses one shared global shrinkage parameter `phi` and one shared residual variance `sigma`, while retaining the block-diagonal LD calculation and conventional per-chromosome output files. If False, run a separate chain for each selected chromosome, matching the existing behavior. Default is False.
+
+- PROFILE (optional): If True, report warm-up and steady-state mean time spent in the beta update, `psi` update and remaining per-iteration work. The first iteration is excluded from steady-state means. Default is False.
 
 
 ## Output
@@ -219,9 +221,25 @@ export OMP_NUM_THREADS=$N_THREADS
 ```
 For example, to use a single thread for the computation, set `N_THREADS=1`.
 
-### Experimental within-chromosome CUDA backends
+### Experimental joint chromosome sampling
 
-The CUDA backends accelerate the beta block update within one chromosome. They deliberately do not provide chromosome-level scheduling: chromosomes can already be submitted as independent jobs on separate machines.
+`--joint_chromosomes=True` changes the sampling model rather than merely scheduling independent chromosome jobs. The selected chromosomes are concatenated as block-diagonal LD blocks and updated in one chain, so automatic `phi` inference and `sigma` inference use genome-wide sufficient statistics. It never constructs a dense genome-wide LD matrix. For example:
+
+```
+python PRScs.py ... --chrom=1,2,3 --joint_chromosomes=True
+```
+
+Joint sampling preserves the normal `_chrN.txt` output files. Because it keeps every selected chromosome's LD state resident at once, its host and device memory requirements are approximately the sum of the chromosome-wise requirements. The default remains False for compatibility with established PRS-CS results. In particular, an automatic-`phi` joint run is not expected to reproduce 22 independently fitted chromosome chains.
+
+The joint mode is backend-independent. On a sufficiently large GPU, pooling LD blocks from every selected chromosome can also create denser CUDA batches:
+
+```
+python PRScs.py ... --joint_chromosomes=True --backend=cuda-adaptive --cuda_streams=20 --psi_backend=cuda-fused --profile=True
+```
+
+### Experimental CUDA backends
+
+The CUDA backends accelerate the independent LD-block beta updates. Without `--joint_chromosomes=True`, chromosomes remain separate jobs and can still be submitted to separate machines.
 
 Install CuPy 14.1 or newer using the package that matches the machine's CUDA runtime. For example, a CUDA 12 installation typically uses:
 

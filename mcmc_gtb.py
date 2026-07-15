@@ -13,12 +13,45 @@ from beta_backend import make_beta_backend
 from psi_backend import make_psi_backend
 
 
+def _chromosome_partitions(chrom, chromosome_slices, p):
+    """Return validated ``(chromosome, start, stop)`` output partitions."""
+    if chromosome_slices is None:
+        return [(int(chrom), 0, p)]
+
+    partitions = []
+    expected_start = 0
+    for chromosome, start, stop in chromosome_slices:
+        chromosome = int(chromosome)
+        start = int(start)
+        stop = int(stop)
+        if start != expected_start or stop < start or stop > p:
+            raise ValueError(
+                'chromosome slices must be contiguous and cover every SNP'
+            )
+        partitions.append((chromosome, start, stop))
+        expected_start = stop
+
+    if not partitions or expected_start != p:
+        raise ValueError(
+            'chromosome slices must be contiguous and cover every SNP'
+        )
+    return partitions
+
+
+def _profile_label(partitions, joint_chromosomes):
+    if not joint_chromosomes:
+        return 'chr%d' % partitions[0][0]
+    chromosomes = ','.join(str(partition[0]) for partition in partitions)
+    return 'joint chr%s' % chromosomes
+
+
 def mcmc(a, b, phi, sst_dict, n, ld_blk, blk_size, n_iter, n_burnin, thin, chrom, out_dir, beta_std, write_psi, write_pst, seed,
          backend='cpu', cuda_device=0, cuda_bucket_size=32, profile='FALSE',
          cuda_streams=4,
          pcg_tol=1e-10, pcg_maxiter=100, pcg_check_interval=4,
          ld_rank_tol=1e-8, ld_factors=None, ld_eigenvalues=None,
-         psi_backend='cpu', cuda_gig_max_rounds=1000):
+         psi_backend='cpu', cuda_gig_max_rounds=1000,
+         chromosome_slices=None):
     print('... MCMC ...')
 
     # seed
@@ -30,6 +63,17 @@ def mcmc(a, b, phi, sst_dict, n, ld_blk, blk_size, n_iter, n_burnin, thin, chrom
     maf = np.array(sst_dict['MAF'], ndmin=2).T
     n_pst = int((n_iter-n_burnin)/thin)
     p = len(sst_dict['SNP'])
+    joint_chromosomes = chromosome_slices is not None
+    partitions = _chromosome_partitions(chrom, chromosome_slices, p)
+    profile_label = _profile_label(partitions, joint_chromosomes)
+
+    if joint_chromosomes:
+        print(
+            '... joint chromosome chain: %d chromosomes, %d SNPs, '
+            '%d active LD blocks ...' % (
+                len(partitions), p, sum(size > 0 for size in blk_size)
+            )
+        )
 
     # initialization
     beta = np.zeros((p,1))
@@ -147,12 +191,12 @@ def mcmc(a, b, phi, sst_dict, n, ld_blk, blk_size, n_iter, n_burnin, thin, chrom
                 profile_total += iteration_elapsed
                 profile_iterations += 1
             if itr == 1:
-                print('[PROFILE chr%d] iter 1 warm-up: beta %.4fs, psi %.4fs, total %.4fs' %
-                      (chrom, beta_elapsed, psi_elapsed, iteration_elapsed))
+                print('[PROFILE %s] iter 1 warm-up: beta %.4fs, psi %.4fs, total %.4fs' %
+                      (profile_label, beta_elapsed, psi_elapsed, iteration_elapsed))
             elif itr % 10 == 0 or itr == n_iter:
                 other = profile_total - profile_beta - profile_psi
-                print('[PROFILE chr%d] steady-state mean over %d iter: beta %.4fs, psi %.4fs, other %.4fs, total %.4fs' %
-                      (chrom, profile_iterations,
+                print('[PROFILE %s] steady-state mean over %d iter: beta %.4fs, psi %.4fs, other %.4fs, total %.4fs' %
+                      (profile_label, profile_iterations,
                        profile_beta/profile_iterations,
                        profile_psi/profile_iterations,
                        other/profile_iterations,
@@ -166,41 +210,64 @@ def mcmc(a, b, phi, sst_dict, n, ld_blk, blk_size, n_iter, n_burnin, thin, chrom
             beta_pst /= np.sqrt(2.0*maf*(1.0-maf))
 
 
-    # write posterior effect sizes
-    if phi_updt == True:
-        eff_file = out_dir + '_pst_eff_a%d_b%.1f_phiauto_chr%d.txt' % (a, b, chrom)
-    else:
-        eff_file = out_dir + '_pst_eff_a%d_b%.1f_phi%1.0e_chr%d.txt' % (a, b, phi, chrom)
-
-    with open(eff_file, 'w') as ff:
-        if write_pst == 'TRUE':
-            for snp, bp, a1, a2, beta in zip(sst_dict['SNP'], sst_dict['BP'], sst_dict['A1'], sst_dict['A2'], beta_pst):
-                ff.write(('%d\t%s\t%d\t%s\t%s' + '\t%.6e'*n_pst + '\n') % (chrom, snp, bp, a1, a2, *beta))
-        else:
-            for snp, bp, a1, a2, beta in zip(sst_dict['SNP'], sst_dict['BP'], sst_dict['A1'], sst_dict['A2'], beta_est):
-                ff.write('%d\t%s\t%d\t%s\t%s\t%.6e\n' %
-                         (chrom, snp, bp, a1, a2, beta.item()))
-
-    # write posterior estimates of psi
-    if write_psi == 'TRUE':
+    # Preserve the conventional per-chromosome output files even when the
+    # selected chromosomes were sampled together in one chain.
+    for chromosome, start, stop in partitions:
         if phi_updt == True:
-            psi_file = out_dir + '_pst_psi_a%d_b%.1f_phiauto_chr%d.txt' % (a, b, chrom)
+            eff_file = out_dir + '_pst_eff_a%d_b%.1f_phiauto_chr%d.txt' % (
+                a, b, chromosome
+            )
         else:
-            psi_file = out_dir + '_pst_psi_a%d_b%.1f_phi%1.0e_chr%d.txt' % (a, b, phi, chrom)
+            eff_file = out_dir + '_pst_eff_a%d_b%.1f_phi%1.0e_chr%d.txt' % (
+                a, b, phi, chromosome
+            )
 
-        with open(psi_file, 'w') as ff:
-            for snp, psi in zip(sst_dict['SNP'], psi_est):
-                ff.write('%s\t%.6e\n' % (snp, psi.item()))
+        with open(eff_file, 'w') as ff:
+            if write_pst == 'TRUE':
+                for snp, bp, a1, a2, beta in zip(
+                        sst_dict['SNP'][start:stop],
+                        sst_dict['BP'][start:stop],
+                        sst_dict['A1'][start:stop],
+                        sst_dict['A2'][start:stop],
+                        beta_pst[start:stop]):
+                    ff.write(
+                        ('%d\t%s\t%d\t%s\t%s' + '\t%.6e'*n_pst + '\n') %
+                        (chromosome, snp, bp, a1, a2, *beta)
+                    )
+            else:
+                for snp, bp, a1, a2, beta in zip(
+                        sst_dict['SNP'][start:stop],
+                        sst_dict['BP'][start:stop],
+                        sst_dict['A1'][start:stop],
+                        sst_dict['A2'][start:stop],
+                        beta_est[start:stop]):
+                    ff.write('%d\t%s\t%d\t%s\t%s\t%.6e\n' %
+                             (chromosome, snp, bp, a1, a2, beta.item()))
+
+        if write_psi == 'TRUE':
+            if phi_updt == True:
+                psi_file = out_dir + '_pst_psi_a%d_b%.1f_phiauto_chr%d.txt' % (
+                    a, b, chromosome
+                )
+            else:
+                psi_file = out_dir + '_pst_psi_a%d_b%.1f_phi%1.0e_chr%d.txt' % (
+                    a, b, phi, chromosome
+                )
+
+            with open(psi_file, 'w') as ff:
+                for snp, psi_value in zip(
+                        sst_dict['SNP'][start:stop], psi_est[start:stop]):
+                    ff.write('%s\t%.6e\n' % (snp, psi_value.item()))
 
     # print estimated phi
     if phi_updt == True:
         print('... Estimated global shrinkage parameter: %1.2e ...' % phi_est )
 
     if profile and hasattr(beta_backend, 'profile_summary'):
-        print('[PROFILE chr%d] %s' %
-              (chrom, beta_backend.profile_summary()))
+        print('[PROFILE %s] %s' %
+              (profile_label, beta_backend.profile_summary()))
     if profile and hasattr(psi_sampler, 'profile_summary'):
-        print('[PROFILE chr%d] %s' %
-              (chrom, psi_sampler.profile_summary()))
+        print('[PROFILE %s] %s' %
+              (profile_label, psi_sampler.profile_summary()))
 
     print('... Done ...')

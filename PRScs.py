@@ -11,7 +11,7 @@ Reference: T Ge, CY Chen, Y Ni, YCA Feng, JW Smoller. Polygenic Prediction via B
 Usage:
 python PRScs.py --ref_dir=PATH_TO_REFERENCE --bim_prefix=VALIDATION_BIM_PREFIX --sst_file=SUM_STATS_FILE --n_gwas=GWAS_SAMPLE_SIZE --out_dir=OUTPUT_DIR
                 [--a=PARAM_A --b=PARAM_B --phi=PARAM_PHI --n_iter=MCMC_ITERATIONS --n_burnin=MCMC_BURNIN --thin=MCMC_THINNING_FACTOR
-                 --chrom=CHROM --write_psi=WRITE_PSI --write_pst=WRITE_POSTERIOR_SAMPLES --seed=SEED
+                 --chrom=CHROM --joint_chromosomes=TRUE|FALSE --write_psi=WRITE_PSI --write_pst=WRITE_POSTERIOR_SAMPLES --seed=SEED
                  --backend=cpu|cuda|cuda-direct|cuda-hybrid|cuda-streams|cuda-adaptive|cuda-fp32|cuda-fp32-streams|cuda-pcg --cuda_device=DEVICE --cuda_bucket_size=SIZE --cuda_streams=STREAMS
                  --pcg_tol=TOL --pcg_maxiter=ITERATIONS --pcg_check_interval=ITERATIONS
                  --ld_diagnostics=TRUE|FALSE --ld_rank_tol=TOL
@@ -32,7 +32,7 @@ import mcmc_gtb
 
 def parse_param():
     long_opts_list = ['ref_dir=', 'bim_prefix=', 'sst_file=', 'a=', 'b=', 'phi=', 'n_gwas=',
-                      'n_iter=', 'n_burnin=', 'thin=', 'out_dir=', 'chrom=', 'beta_std=', 'write_psi=', 'write_pst=', 'seed=', 'help']
+                      'n_iter=', 'n_burnin=', 'thin=', 'out_dir=', 'chrom=', 'joint_chromosomes=', 'beta_std=', 'write_psi=', 'write_pst=', 'seed=', 'help']
 
     long_opts_list += [
         'backend=', 'cuda_device=', 'cuda_bucket_size=', 'cuda_streams=',
@@ -44,6 +44,7 @@ def parse_param():
 
     param_dict = {'ref_dir': None, 'bim_prefix': None, 'sst_file': None, 'a': 1, 'b': 0.5, 'phi': None, 'n_gwas': None,
                   'n_iter': 1000, 'n_burnin': 500, 'thin': 5, 'out_dir': None, 'chrom': range(1,23),
+                  'joint_chromosomes': 'FALSE',
                   'beta_std': 'FALSE', 'write_psi': 'FALSE', 'write_pst': 'FALSE', 'seed': None,
                   'backend': 'cpu', 'cuda_device': 0, 'cuda_bucket_size': 32,
                   'cuda_streams': 4, 'profile': 'FALSE',
@@ -94,6 +95,7 @@ def parse_param():
             elif opt == "--ld_rank_tol": param_dict['ld_rank_tol'] = float(arg)
             elif opt == "--psi_backend": param_dict['psi_backend'] = arg.lower()
             elif opt == "--cuda_gig_max_rounds": param_dict['cuda_gig_max_rounds'] = int(arg)
+            elif opt == "--joint_chromosomes": param_dict['joint_chromosomes'] = arg.upper()
     else:
         print(__doc__)
         sys.exit(0)
@@ -157,6 +159,9 @@ def parse_param():
     elif param_dict['cuda_gig_max_rounds'] < 1:
         print('* --cuda_gig_max_rounds must be at least 1\n')
         sys.exit(2)
+    elif param_dict['joint_chromosomes'] not in ('TRUE', 'FALSE'):
+        print('* --joint_chromosomes must be True or False\n')
+        sys.exit(2)
 
     for key in param_dict:
         print('--%s=%s' % (key, param_dict[key]))
@@ -165,65 +170,191 @@ def parse_param():
     return param_dict
 
 
-def main():
-    param_dict = parse_param()
-
-    for chrom in param_dict['chrom']:
-        print('##### process chromosome %d #####' % int(chrom))
-
-        if '1kg' in os.path.basename(param_dict['ref_dir']):
-            ref_dict = parse_genet.parse_ref(param_dict['ref_dir'] + '/snpinfo_1kg_hm3', int(chrom))
-        elif 'ukbb' in os.path.basename(param_dict['ref_dir']):
-            ref_dict = parse_genet.parse_ref(param_dict['ref_dir'] + '/snpinfo_ukbb_hm3', int(chrom))
-
-        vld_dict = parse_genet.parse_bim(param_dict['bim_prefix'], int(chrom))
-
-        sst_dict = parse_genet.parse_sumstats(ref_dict, vld_dict, param_dict['sst_file'], param_dict['n_gwas'])
-
-        need_ld_factors = param_dict['backend'] == 'cuda-pcg'
-        if need_ld_factors:
-            ld_blk, blk_size, ld_factors, ld_eigenvalues = \
-                parse_genet.parse_ldblk(
-                    param_dict['ref_dir'], sst_dict, int(chrom),
-                    return_factors=True,
-                )
-        else:
-            ld_blk, blk_size = parse_genet.parse_ldblk(
-                param_dict['ref_dir'], sst_dict, int(chrom)
-            )
-            ld_factors = None
-            ld_eigenvalues = None
-
-        if param_dict['ld_diagnostics'] == 'TRUE':
-            from beta_backend import diagnose_ld_blocks, format_ld_diagnostics
-            diagnostics = diagnose_ld_blocks(
-                ld_blk, blk_size,
-                bucket_size=param_dict['cuda_bucket_size'],
-                rank_rtol=param_dict['ld_rank_tol'],
-                ld_eigenvalues=ld_eigenvalues,
-                adaptive=param_dict['backend'] == 'cuda-adaptive',
-            )
-            print(format_ld_diagnostics(diagnostics))
-
-        mcmc_gtb.mcmc(
-            param_dict['a'], param_dict['b'], param_dict['phi'], sst_dict,
-            param_dict['n_gwas'], ld_blk, blk_size, param_dict['n_iter'],
-            param_dict['n_burnin'], param_dict['thin'], int(chrom),
-            param_dict['out_dir'], param_dict['beta_std'],
-            param_dict['write_psi'], param_dict['write_pst'],
-            param_dict['seed'], backend=param_dict['backend'],
-            cuda_device=param_dict['cuda_device'],
-            cuda_bucket_size=param_dict['cuda_bucket_size'],
-            cuda_streams=param_dict['cuda_streams'],
-            profile=param_dict['profile'], pcg_tol=param_dict['pcg_tol'],
-            pcg_maxiter=param_dict['pcg_maxiter'],
-            pcg_check_interval=param_dict['pcg_check_interval'],
-            ld_rank_tol=param_dict['ld_rank_tol'],
-            ld_factors=ld_factors, ld_eigenvalues=ld_eigenvalues,
-            psi_backend=param_dict['psi_backend'],
-            cuda_gig_max_rounds=param_dict['cuda_gig_max_rounds'],
+def _load_chromosome(param_dict, chrom):
+    if '1kg' in os.path.basename(param_dict['ref_dir']):
+        ref_file = param_dict['ref_dir'] + '/snpinfo_1kg_hm3'
+    elif 'ukbb' in os.path.basename(param_dict['ref_dir']):
+        ref_file = param_dict['ref_dir'] + '/snpinfo_ukbb_hm3'
+    else:
+        raise ValueError(
+            'reference directory name must contain either 1kg or ukbb'
         )
 
+    ref_dict = parse_genet.parse_ref(ref_file, chrom)
+    vld_dict = parse_genet.parse_bim(param_dict['bim_prefix'], chrom)
+    sst_dict = parse_genet.parse_sumstats(
+        ref_dict, vld_dict, param_dict['sst_file'], param_dict['n_gwas']
+    )
+
+    need_ld_factors = param_dict['backend'] == 'cuda-pcg'
+    if need_ld_factors:
+        ld_blk, blk_size, ld_factors, ld_eigenvalues = \
+            parse_genet.parse_ldblk(
+                param_dict['ref_dir'], sst_dict, chrom,
+                return_factors=True,
+            )
+    else:
+        ld_blk, blk_size = parse_genet.parse_ldblk(
+            param_dict['ref_dir'], sst_dict, chrom
+        )
+        ld_factors = None
+        ld_eigenvalues = None
+
+    return {
+        'chrom': chrom,
+        'sst_dict': sst_dict,
+        'ld_blk': ld_blk,
+        'blk_size': blk_size,
+        'ld_factors': ld_factors,
+        'ld_eigenvalues': ld_eigenvalues,
+    }
+
+
+def _combine_chromosomes(chromosome_inputs):
+    if not chromosome_inputs:
+        raise ValueError('at least one chromosome must be selected')
+
+    sst_dict = {
+        key: [] for key in chromosome_inputs[0]['sst_dict']
+    }
+    ld_blk = []
+    blk_size = []
+    chromosome_slices = []
+    ld_factors = []
+    ld_eigenvalues = []
+    include_factors = any(
+        chromosome_input['ld_factors'] is not None
+        for chromosome_input in chromosome_inputs
+    )
+    seen_chromosomes = set()
+    start = 0
+
+    for chromosome_input in chromosome_inputs:
+        chromosome = int(chromosome_input['chrom'])
+        if chromosome in seen_chromosomes:
+            raise ValueError(
+                'joint chromosome selection contains chromosome %d twice' %
+                chromosome
+            )
+        seen_chromosomes.add(chromosome)
+
+        chromosome_sst = chromosome_input['sst_dict']
+        if set(chromosome_sst) != set(sst_dict):
+            raise ValueError('all chromosome summary dictionaries must match')
+        if len(chromosome_input['ld_blk']) != len(
+                chromosome_input['blk_size']):
+            raise ValueError(
+                'LD blocks and sizes must match on chromosome %d' % chromosome
+            )
+        if sum(chromosome_input['blk_size']) != len(chromosome_sst['SNP']):
+            raise ValueError(
+                'LD blocks do not cover every SNP on chromosome %d' %
+                chromosome
+            )
+        for key in sst_dict:
+            sst_dict[key].extend(chromosome_sst[key])
+
+        ld_blk.extend(chromosome_input['ld_blk'])
+        blk_size.extend(chromosome_input['blk_size'])
+        if include_factors:
+            if (chromosome_input['ld_factors'] is None or
+                    chromosome_input['ld_eigenvalues'] is None):
+                raise ValueError('LD factors must be present for every chromosome')
+            if (len(chromosome_input['ld_factors']) !=
+                    len(chromosome_input['ld_blk']) or
+                    len(chromosome_input['ld_eigenvalues']) !=
+                    len(chromosome_input['ld_blk'])):
+                raise ValueError(
+                    'LD factors and blocks must match on chromosome %d' %
+                    chromosome
+                )
+            ld_factors.extend(chromosome_input['ld_factors'])
+            ld_eigenvalues.extend(chromosome_input['ld_eigenvalues'])
+
+        stop = start + len(chromosome_sst['SNP'])
+        chromosome_slices.append(
+            (chromosome, start, stop)
+        )
+        start = stop
+
+    return {
+        'sst_dict': sst_dict,
+        'ld_blk': ld_blk,
+        'blk_size': blk_size,
+        'ld_factors': ld_factors if include_factors else None,
+        'ld_eigenvalues': ld_eigenvalues if include_factors else None,
+        'chromosome_slices': chromosome_slices,
+    }
+
+
+def _print_ld_diagnostics(param_dict, chromosome_input):
+    if param_dict['ld_diagnostics'] != 'TRUE':
+        return
+
+    from beta_backend import diagnose_ld_blocks, format_ld_diagnostics
+    diagnostics = diagnose_ld_blocks(
+        chromosome_input['ld_blk'], chromosome_input['blk_size'],
+        bucket_size=param_dict['cuda_bucket_size'],
+        rank_rtol=param_dict['ld_rank_tol'],
+        ld_eigenvalues=chromosome_input['ld_eigenvalues'],
+        adaptive=param_dict['backend'] == 'cuda-adaptive',
+    )
+    print(format_ld_diagnostics(diagnostics))
+
+
+def _run_mcmc(param_dict, chromosome_input, chrom,
+              chromosome_slices=None):
+    mcmc_gtb.mcmc(
+        param_dict['a'], param_dict['b'], param_dict['phi'],
+        chromosome_input['sst_dict'], param_dict['n_gwas'],
+        chromosome_input['ld_blk'], chromosome_input['blk_size'],
+        param_dict['n_iter'], param_dict['n_burnin'], param_dict['thin'],
+        chrom, param_dict['out_dir'], param_dict['beta_std'],
+        param_dict['write_psi'], param_dict['write_pst'],
+        param_dict['seed'], backend=param_dict['backend'],
+        cuda_device=param_dict['cuda_device'],
+        cuda_bucket_size=param_dict['cuda_bucket_size'],
+        cuda_streams=param_dict['cuda_streams'],
+        profile=param_dict['profile'], pcg_tol=param_dict['pcg_tol'],
+        pcg_maxiter=param_dict['pcg_maxiter'],
+        pcg_check_interval=param_dict['pcg_check_interval'],
+        ld_rank_tol=param_dict['ld_rank_tol'],
+        ld_factors=chromosome_input['ld_factors'],
+        ld_eigenvalues=chromosome_input['ld_eigenvalues'],
+        psi_backend=param_dict['psi_backend'],
+        cuda_gig_max_rounds=param_dict['cuda_gig_max_rounds'],
+        chromosome_slices=chromosome_slices,
+    )
+
+
+def main():
+    param_dict = parse_param()
+    chromosomes = [int(chrom) for chrom in param_dict['chrom']]
+
+    if param_dict['joint_chromosomes'] == 'TRUE':
+        print(
+            '##### jointly process chromosomes %s #####' %
+            ','.join(str(chrom) for chrom in chromosomes)
+        )
+        chromosome_inputs = []
+        for chrom in chromosomes:
+            print('##### load chromosome %d #####' % chrom)
+            chromosome_inputs.append(_load_chromosome(param_dict, chrom))
+
+        joint_input = _combine_chromosomes(chromosome_inputs)
+        _print_ld_diagnostics(param_dict, joint_input)
+        _run_mcmc(
+            param_dict, joint_input, chromosomes,
+            chromosome_slices=joint_input['chromosome_slices'],
+        )
+        print('\n')
+        return
+
+    for chrom in chromosomes:
+        print('##### process chromosome %d #####' % chrom)
+        chromosome_input = _load_chromosome(param_dict, chrom)
+        _print_ld_diagnostics(param_dict, chromosome_input)
+        _run_mcmc(param_dict, chromosome_input, chrom)
         print('\n')
 
 
