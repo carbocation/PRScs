@@ -366,6 +366,10 @@ class CpuPsiBackend:
 
     name = "cpu"
 
+    def __init__(self, seed=None):
+        if seed is not None:
+            gigrnd.seed_rng(seed)
+
     def sample(self, out, a_minus_half, delta, beta, sigma, n):
         gigrnd.gig_rvs_vec(
             out, float(a_minus_half), delta, beta, float(sigma), int(n)
@@ -856,7 +860,7 @@ def make_psi_backend(backend, size, seed=None, cuda_device=0,
                      cuda_gig_max_rounds=1000):
     backend = str(backend).lower()
     if backend == "cpu":
-        return CpuPsiBackend()
+        return CpuPsiBackend(seed=seed)
     if backend == "cuda":
         return CudaPsiBackend(
             size,

@@ -196,7 +196,7 @@ where SNP is the rs ID, A1 is the effect allele, A2 is the alternative allele, B
 
 - LD_RANK_TOL (optional): Relative eigenvalue threshold used only to report effective LD rank. Default is `1e-8`; the FP64 PCG backend retains every non-negative eigencomponent and does not truncate at this threshold.
 
-- PSI_BACKEND (optional): `cpu` uses the existing fused Numba GIG sampler and is the default. `cuda` uses a vectorized Devroye rejection sampler driven by CuPy's device RNG. Seeded runs are reproducible within a fixed backend but CPU and CUDA streams differ.
+- PSI_BACKEND (optional): `cpu` uses the existing fused Numba GIG sampler and is the default. Its compiled entry points are cached on disk for reuse by later compatible Python processes; set `NUMBA_CACHE_DIR` to override the cache location. `cuda` uses a vectorized Devroye rejection sampler driven by CuPy's device RNG. Seeded runs are reproducible within a fixed backend but CPU and CUDA streams differ.
 
 - ROUNDS (optional): Maximum vector rejection rounds for the CUDA GIG sampler. Default is 1000. The sampler fails explicitly instead of returning incomplete draws if this bound is reached.
 

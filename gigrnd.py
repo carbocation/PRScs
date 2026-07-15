@@ -122,13 +122,13 @@ def gigrnd(p, a, b):
     return rnd
 
 
-@njit
+@njit(cache=True)
 def seed_rng(seed):
     """Seed Numba's RNG, which is separate from NumPy's Python RNG."""
     np.random.seed(seed)
 
 
-@njit(fastmath=True)
+@njit(fastmath=True, cache=True)
 def gig_rvs_vec(out, a_minus_half, delta, beta, sigma, n):
     """Fill ``out`` with GIG draws without a Python call per variant."""
     for jj in range(out.size):
@@ -137,4 +137,3 @@ def gig_rvs_vec(out, a_minus_half, delta, beta, sigma, n):
             2.0 * delta[jj],
             n * beta[jj] * beta[jj] / sigma,
         )
-

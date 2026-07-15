@@ -9,7 +9,6 @@ Markov Chain Monte Carlo (MCMC) sampler for polygenic prediction with continuous
 import time
 
 import numpy as np
-import gigrnd
 from beta_backend import make_beta_backend
 from psi_backend import make_psi_backend
 
@@ -25,7 +24,6 @@ def mcmc(a, b, phi, sst_dict, n, ld_blk, blk_size, n_iter, n_burnin, thin, chrom
     # seed
     if seed is not None:
         np.random.seed(seed)
-        gigrnd.seed_rng(seed)
 
     # derived stats
     beta_mrg = np.array(sst_dict['BETA'], ndmin=2).T

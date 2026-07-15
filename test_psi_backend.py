@@ -4,6 +4,7 @@
 
 
 import unittest
+from unittest import mock
 
 import numpy as np
 from scipy.special import kv
@@ -43,6 +44,39 @@ class CpuPsiBackendTests(unittest.TestCase):
             actual, 0.5, delta, beta, 1.0, 200_000
         )
         np.testing.assert_array_equal(actual, expected)
+
+    def test_factory_seeds_cpu_numba_stream(self):
+        size = 100
+        delta = np.linspace(0.1, 2.0, size)
+        beta = np.linspace(0.0001, 0.01, size)
+        first = np.empty(size)
+        second = np.empty(size)
+
+        make_psi_backend("cpu", size, seed=321).sample(
+            first, 0.5, delta, beta, 1.0, 200_000
+        )
+        make_psi_backend("cpu", size, seed=321).sample(
+            second, 0.5, delta, beta, 1.0, 200_000
+        )
+
+        np.testing.assert_array_equal(first, second)
+
+    def test_non_cpu_factory_does_not_seed_numba_stream(self):
+        sentinel = object()
+        with mock.patch.object(gigrnd, "seed_rng") as seed_rng:
+            with mock.patch(
+                    "psi_backend.CudaPsiBackend", return_value=sentinel
+            ) as cuda_backend:
+                actual = make_psi_backend("cuda", 10, seed=654)
+
+        self.assertIs(actual, sentinel)
+        seed_rng.assert_not_called()
+        cuda_backend.assert_called_once_with(
+            10,
+            seed=654,
+            cuda_device=0,
+            cuda_gig_max_rounds=1000,
+        )
 
     def test_factory_rejects_unknown_backend(self):
         with self.assertRaisesRegex(ValueError, "unknown psi backend"):
